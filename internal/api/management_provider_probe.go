@@ -56,9 +56,28 @@ func probeEndpointForFamily(family, baseURL, model string) (probeSpec, error) {
 		if !strings.HasSuffix(strings.ToLower(target), "/chat/completions") {
 			target = join("/chat/completions")
 		}
+		body := map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "Hi"}}, "stream": false, "max_tokens": 5}
+		apiRoot := strings.TrimSuffix(trimmed, "/chat/completions")
+		switch name := strings.ToLower(model); {
+		case strings.Contains(name, "embedding"):
+			target = strings.TrimSuffix(apiRoot, "/embeddings") + "/embeddings"
+			body = map[string]any{"model": model, "input": []string{"Hi"}}
+		case strings.Contains(name, "rerank"):
+			target = strings.TrimSuffix(apiRoot, "/rerank") + "/rerank"
+			body = map[string]any{"model": model, "query": "Hi", "documents": []string{"Hi"}, "top_n": 1}
+			if endpoint, err := url.Parse(apiRoot); err == nil {
+				host := strings.ToLower(endpoint.Hostname())
+				isTongyi := host == "dashscope.aliyuncs.com" || host == "dashscope-intl.aliyuncs.com" || strings.HasSuffix(host, ".dashscope.aliyuncs.com") || strings.HasSuffix(host, ".maas.aliyuncs.com")
+				if isTongyi && strings.HasSuffix(endpoint.Path, "/compatible-mode/v1") {
+					endpoint.Path = strings.TrimSuffix(endpoint.Path, "/compatible-mode/v1") + "/api/v1/services/rerank/text-rerank/text-rerank"
+					target = endpoint.String()
+					body = map[string]any{"model": model, "input": map[string]any{"query": "Hi", "documents": []string{"Hi"}}, "parameters": map[string]any{"top_n": 1}}
+				}
+			}
+		}
 		return probeSpec{
 			target: target,
-			body:   map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "Hi"}}, "stream": false, "max_tokens": 5},
+			body:   body,
 			apply: func(header http.Header, apiKey string) {
 				setProbeAuthHeader(header, "Authorization", "Bearer "+apiKey)
 			},

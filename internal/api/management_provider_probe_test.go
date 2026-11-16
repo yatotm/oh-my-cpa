@@ -171,6 +171,50 @@ func TestProbeProviderSendsEachFamilyDialect(t *testing.T) {
 	}
 }
 
+func TestProbeEmbeddingAndRerankModels(t *testing.T) {
+	for _, tc := range []struct {
+		model, base, target string
+		nativeRerank        bool
+	}{
+		{"text-embedding-v4", "https://dashscope.aliyuncs.com/compatible-mode/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings", false},
+		{"qwen3.7-text-embedding", "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions", "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings", false},
+		{"gte-rerank-v2", "https://dashscope.aliyuncs.com/compatible-mode/v1", "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank", true},
+		{"qwen3.7-text-rerank", "https://workspace.cn-beijing.maas.aliyuncs.com/prefix/compatible-mode/v1", "https://workspace.cn-beijing.maas.aliyuncs.com/prefix/api/v1/services/rerank/text-rerank/text-rerank", true},
+		{"bge-reranker-v2-m3", "https://example.com/v1", "https://example.com/v1/rerank", false},
+		{"gte-rerank-v2", "https://maas.aliyuncs.com.example.com/compatible-mode/v1", "https://maas.aliyuncs.com.example.com/compatible-mode/v1/rerank", false},
+	} {
+		t.Run(tc.model+tc.base, func(t *testing.T) {
+			spec, err := probeEndpointForFamily(openAICompatibilityFamily, tc.base, tc.model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if spec.target != tc.target {
+				t.Fatalf("target=%s want=%s", spec.target, tc.target)
+			}
+			if spec.body["model"] != tc.model || spec.body["messages"] != nil || spec.body["max_tokens"] != nil {
+				t.Fatalf("unexpected non-chat request: %#v", spec.body)
+			}
+			if strings.Contains(tc.model, "embedding") {
+				if input, ok := spec.body["input"].([]string); !ok || len(input) != 1 || input[0] != "Hi" {
+					t.Fatal(spec.body)
+				}
+			} else if tc.nativeRerank {
+				input, ok := spec.body["input"].(map[string]any)
+				if !ok || input["query"] != "Hi" || spec.body["parameters"].(map[string]any)["top_n"] != 1 {
+					t.Fatal(spec.body)
+				}
+			} else if spec.body["query"] != "Hi" || spec.body["top_n"] != 1 {
+				t.Fatal(spec.body)
+			}
+			header := http.Header{}
+			spec.apply(header, "test-key")
+			if header.Get("Authorization") != "Bearer test-key" {
+				t.Fatal("probe authentication changed")
+			}
+		})
+	}
+}
+
 func TestProbeProviderRefusesBadRequests(t *testing.T) {
 	useProviderDNS(t, map[string][]net.IP{"example.test.": {net.ParseIP("93.184.216.34")}})
 	fixture := newProviderTestFixture(t)
