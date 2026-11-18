@@ -178,11 +178,14 @@ const PARAMETERISED_ROUTES = [
   },
   { path: '/api/v1/management/insights/cube', resolve: (url) => `insights-cube-${insightsPresetOf(url)}` },
   { path: '/api/v1/management/insights/rhythm', resolve: (url) => `insights-rhythm-${insightsPresetOf(url)}` },
+  { path: '/api/v1/management/insights/clients', resolve: (url) => `insights-clients-${insightsPresetOf(url)}` },
   {
     path: '/api/v1/management/dashboard/models',
     resolve: (url) => {
       const preset = dashboardPresetOf(url);
-      const grouping = url.searchParams.get('group_by') === 'model' ? 'model' : 'call';
+      // The console omits the parameter for the model view, which is also the server's default.
+      const requested = url.searchParams.get('group_by');
+      const grouping = requested === 'call' || requested === 'client' ? requested : 'model';
       return `dashboard-models-${grouping}-${preset}`;
     },
   },

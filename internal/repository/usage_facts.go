@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -26,8 +27,10 @@ const QuarterHourBucketMS int64 = 15 * 60 * 1000
 const LifecycleUsageDetail = "usage_detail"
 
 const (
-	usageFactsFineTable  = "usage_facts_15m"
-	usageFactsDailyTable = "usage_facts_daily"
+	usageFactsFineTable        = "usage_facts_15m"
+	usageFactsDailyTable       = "usage_facts_daily"
+	usageClientFactsFineTable  = "usage_client_facts_15m"
+	usageClientFactsDailyTable = "usage_client_facts_daily"
 	// usageFactsLocalTable holds whole local days in the one zone its checkpoint
 	// marker names; see migration 047.
 	usageFactsLocalTable = "usage_facts_local_daily"
@@ -40,6 +43,127 @@ const (
 // usage_events carries the same names, so one expression groups either source.
 const usageFactDimensions = `api_group_key, model, model_alias, auth_index, provider, auth_type`
 
+// usageClientFactDimensions extends usageFactDimensions with persisted client attribution.
+const usageClientFactDimensions = usageFactDimensions + `, client_agent, client_prefix`
+
+// Per-event additive token partition SQL shared by unfolded usage_events reads,
+// 15-minute fact folding, historical upgrade reconstruction, and caller agent
+// attribution.
+//
+// Upstream token semantics follow CPA's ordered, mutually exclusive precedence
+// (sdk/cliproxy/usage/accounting.go tokenAccountingSemanticsFor):
+//
+//	1 = subset             (input includes cache, output includes reasoning)
+//	2 = independent        (input excludes cache, output includes thinking)
+//	3 = separate_reasoning (input includes cache, output excludes thoughts)
+//	0 = unknown            (exact conservation equality only; inbound endpoint
+//	                        is consulted ONLY when provider/executor are blank/unknown)
+//
+// Staged subqueries evaluate json_extract(token_accounting, '$.status') and the
+// ordered protocol CASE at most once per legacy row with non-zero cache/reasoning,
+// keeping 100k-row scans well inside a single-digit fraction of the 15s budget.
+const (
+	// Stage 1 columns computed once per row on a usage_events source.
+	// Note: SQLite's ASCII LIKE is already case-insensitive, avoiding redundant LOWER() calls.
+	eventSemanticsCodeExpr = `(CASE
+		WHEN TRIM(COALESCE(executor_type, '')) LIKE 'openaicompatexecutor'
+		  OR TRIM(COALESCE(provider, '')) LIKE 'openai-compatibility'
+		  OR TRIM(COALESCE(provider, '')) LIKE 'openai-compatible-%' THEN 1
+		WHEN COALESCE(provider, '') LIKE '%claude%'
+		  OR COALESCE(provider, '') LIKE '%anthropic%'
+		  OR COALESCE(executor_type, '') LIKE '%claude%'
+		  OR COALESCE(executor_type, '') LIKE '%anthropic%' THEN 2
+		WHEN COALESCE(provider, '') LIKE '%gemini%'
+		  OR COALESCE(provider, '') LIKE '%aistudio%'
+		  OR COALESCE(provider, '') LIKE '%antigravity%'
+		  OR COALESCE(provider, '') LIKE '%vertex%'
+		  OR COALESCE(provider, '') LIKE '%interaction%'
+		  OR COALESCE(executor_type, '') LIKE '%gemini%'
+		  OR COALESCE(executor_type, '') LIKE '%aistudio%'
+		  OR COALESCE(executor_type, '') LIKE '%antigravity%'
+		  OR COALESCE(executor_type, '') LIKE '%vertex%'
+		  OR COALESCE(executor_type, '') LIKE '%interaction%' THEN 3
+		WHEN COALESCE(provider, '') LIKE '%openai%'
+		  OR COALESCE(provider, '') LIKE '%codex%'
+		  OR COALESCE(provider, '') LIKE '%xai%'
+		  OR COALESCE(provider, '') LIKE '%grok%'
+		  OR COALESCE(provider, '') LIKE '%kimi%'
+		  OR COALESCE(provider, '') LIKE '%qwen%'
+		  OR COALESCE(provider, '') LIKE '%deepseek%'
+		  OR COALESCE(provider, '') LIKE '%openrouter%'
+		  OR COALESCE(executor_type, '') LIKE '%openai%'
+		  OR COALESCE(executor_type, '') LIKE '%codex%'
+		  OR COALESCE(executor_type, '') LIKE '%xai%'
+		  OR COALESCE(executor_type, '') LIKE '%grok%'
+		  OR COALESCE(executor_type, '') LIKE '%kimi%'
+		  OR COALESCE(executor_type, '') LIKE '%qwen%'
+		  OR COALESCE(executor_type, '') LIKE '%deepseek%'
+		  OR COALESCE(executor_type, '') LIKE '%openrouter%' THEN 1
+		WHEN (TRIM(COALESCE(provider, '')) = '' OR TRIM(COALESCE(provider, '')) LIKE 'unknown')
+		  AND (TRIM(COALESCE(executor_type, '')) = '' OR TRIM(COALESCE(executor_type, '')) LIKE 'unknown') THEN (CASE
+			WHEN endpoint LIKE '%/v1/messages%' THEN 2
+			WHEN endpoint LIKE '%:generateContent%' OR endpoint LIKE '%:streamGenerateContent%' THEN 3
+			WHEN endpoint LIKE '%/chat/completions%' OR endpoint LIKE '%/responses%' THEN 1
+			ELSE 0
+		END)
+		ELSE 0
+	END)`
+
+	eventStage1Cols = `
+		CASE WHEN token_accounting IS NULL THEN 0 WHEN json_extract(token_accounting, '$.status') = 'complete' THEN 1 ELSE 0 END AS _isc,
+		CASE WHEN token_accounting IS NULL THEN 0 WHEN json_extract(token_accounting, '$.status') <> 'complete' THEN 1 ELSE 0 END AS _iur,
+		CASE
+			WHEN token_accounting IS NOT NULL AND json_extract(token_accounting, '$.status') = 'complete' THEN 1
+			WHEN input_tokens > 0 AND cached_tokens <= 0 AND cache_read_tokens <= 0 AND cache_creation_tokens <= 0 AND reasoning_tokens <= 0 THEN 1
+			ELSE ` + eventSemanticsCodeExpr + `
+		END AS _sem,
+		MAX(input_tokens, 0) AS _ri,
+		MAX(output_tokens, 0) AS _ro,
+		MAX(reasoning_tokens, 0) AS _rr,
+		cached_tokens AS _rc,
+		MAX(cache_read_tokens, 0) AS _rcr,
+		CASE
+			WHEN token_accounting IS NOT NULL AND json_extract(token_accounting, '$.status') = 'complete' THEN MAX(cache_read_tokens, 0)
+			WHEN cache_read_tokens > 0 THEN cache_read_tokens
+			ELSE MAX(cached_tokens, 0)
+		END AS _cr,
+		MAX(cache_creation_tokens, 0) AS _cw,
+		MAX(total_tokens, 0) AS _rt,
+		MAX(output_tokens, reasoning_tokens, 0) AS _mc,
+		(MAX(output_tokens, 0) + MAX(reasoning_tokens, 0)) AS _sc`
+
+	// Stage 2 integer-only expressions over Stage 1 columns (_isc, _sem, _ri, _ro, _rr, _rc, _rcr, _cr, _cw, _rt, _mc, _sc).
+	// Known independent protocols (_sem = 2) with explicit Anthropic cache columns (_rcr > 0 OR _cw > 0)
+	// always count uncached input beside cache without any total_tokens range gate.
+	// Zero-input deduction (_ri = 0 && _rt > _comp) applies ONLY to unknown protocols (_sem = 0)
+	// that carry no explicit cache buckets at all.
+	stagePromptBaseExpr = `(CASE
+		WHEN _isc = 1 THEN _ri
+		WHEN (_cr + _cw) > 0 AND _ri > 0 AND (
+			(_sem = 2 AND (_rcr > 0 OR _cw > 0))
+			OR (_sem = 0 AND (
+				(_ri < (_cr + _cw) AND _rt <= _ri + _mc)
+				OR (_rc <= 0 AND ((_rr = 0 AND _rt = _ri + (_cr + _cw) + _mc) OR (_rr > 0 AND _rt = _ri + (_cr + _cw) + _sc)))
+			))
+		) THEN _ri + (_cr + _cw)
+		ELSE MAX(_ri, _cr + _cw)
+	END)`
+	stageCompFromPBExpr = `(CASE
+		WHEN _isc = 1 THEN _ro
+		WHEN _rr > 0 AND _ro > 0 AND (
+			_sem = 3
+			OR (_sem = 0 AND _rt = _pb + _sc)
+		) THEN _sc
+		ELSE _mc
+	END)`
+	stagePromptFromPBCompExpr = `(CASE
+		WHEN _isc = 1 THEN _ri
+		WHEN _sem = 0 AND _ri = 0 AND (_cr + _cw) = 0 AND _rc <= 0 AND _rt > _comp THEN _rt - _comp
+		ELSE _pb
+	END)`
+	stageTotalExpr = `MAX(_rt, _pr + _comp)`
+)
+
 // usageFactMeasures lists the additive columns, in the order every read scans them.
 var usageFactMeasures = []string{
 	"requests", "failures", "input_tokens", "output_tokens", "reasoning_tokens",
@@ -47,21 +171,72 @@ var usageFactMeasures = []string{
 	"latency_sum_ms", "ttft_sum_ms", "ttft_count", "cost_nanos", "priced_requests",
 	"costed_requests", "canonical_requests", "unresolved_accounting_requests",
 	"raw_input_tokens", "raw_output_tokens", "raw_total_tokens",
+	"prompt_tokens", "completion_tokens", "effective_cache_read_tokens", "effective_total_tokens",
 }
 
-// usageEventMeasures is one request record expressed as the same measures, so a
-// record that has not been folded yet contributes exactly what its fact row will.
-const usageEventMeasures = `
-	1 AS requests, failed AS failures, input_tokens, output_tokens, reasoning_tokens,
-	cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-	latency_ms AS latency_sum_ms, COALESCE(ttft_ms, 0) AS ttft_sum_ms,
-	(ttft_ms IS NOT NULL) AS ttft_count, COALESCE(cost_nanos, 0) AS cost_nanos,
-	(pricing_status = 'priced') AS priced_requests, (cost_nanos IS NOT NULL) AS costed_requests,
-	CASE WHEN token_accounting IS NULL THEN 0 WHEN json_extract(token_accounting, '$.status') = 'complete' THEN 1 ELSE 0 END AS canonical_requests,
-	CASE WHEN token_accounting IS NULL THEN 0 WHEN json_extract(token_accounting, '$.status') <> 'complete' THEN 1 ELSE 0 END AS unresolved_accounting_requests,
-	CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.input_tokens'), 0) END AS raw_input_tokens,
-	CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.output_tokens'), 0) END AS raw_output_tokens,
-	CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.total_tokens'), 0) END AS raw_total_tokens`
+// usageClientFactMeasures lists the additive columns rolled into usage_client_facts_*.
+var usageClientFactMeasures = []string{
+	"retained_requests", "requests", "failures", "prompt_tokens", "completion_tokens",
+	"reasoning_tokens", "effective_cache_read_tokens", "cache_creation_tokens",
+	"effective_total_tokens", "latency_sum_ms", "ttft_sum_ms", "ttft_count",
+	"cost_nanos", "priced_requests", "costed_requests",
+}
+
+// usageClientFactProjection reads a client fact row under usageFactMeasures'
+// names and order. Client facts hold the normalised accounting only, so the
+// normalised partitions stand in for the raw columns and every row is canonical.
+var usageClientFactProjection = func() string {
+	sources := []string{
+		"requests", "failures", "prompt_tokens", "completion_tokens", "reasoning_tokens",
+		"effective_cache_read_tokens", "effective_cache_read_tokens", "cache_creation_tokens", "effective_total_tokens",
+		"latency_sum_ms", "ttft_sum_ms", "ttft_count", "cost_nanos", "priced_requests",
+		"costed_requests", "requests", "0",
+		"0", "0", "0",
+		"prompt_tokens", "completion_tokens", "effective_cache_read_tokens", "effective_total_tokens",
+	}
+	columns := make([]string, len(sources))
+	for index, source := range sources {
+		columns[index] = source + " AS " + usageFactMeasures[index]
+	}
+	return strings.Join(columns, ", ")
+}()
+
+// buildStagedUsageEventsArm builds a single-MATERIALIZED pipeline over usage_events
+// so protocol classification executes at most once per legacy row with non-zero
+// cache/reasoning, while integer arithmetic stays streaming without extra temp B-trees.
+func buildStagedUsageEventsArm(keySelect, keyPass, alignedExpr, indexClause, wherePredicate string) string {
+	return `
+		SELECT 0 AS from_facts, ` + keyPass + `aligned,
+		       1 AS requests, failed AS failures, input_tokens, output_tokens, reasoning_tokens,
+		       cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+		       latency_ms AS latency_sum_ms, COALESCE(ttft_ms, 0) AS ttft_sum_ms,
+		       (ttft_ms IS NOT NULL) AS ttft_count, COALESCE(cost_nanos, 0) AS cost_nanos,
+		       (pricing_status = 'priced') AS priced_requests, (cost_nanos IS NOT NULL) AS costed_requests,
+		       _isc AS canonical_requests, _iur AS unresolved_accounting_requests,
+		       raw_input_tokens, raw_output_tokens, raw_total_tokens,
+		       _pr AS prompt_tokens, _comp AS completion_tokens, _cr AS effective_cache_read_tokens, ` + stageTotalExpr + ` AS effective_total_tokens
+		FROM (
+			WITH s1 AS MATERIALIZED (
+				SELECT ` + keySelect + alignedExpr + ` AS aligned,
+				       failed, input_tokens, output_tokens, reasoning_tokens,
+				       cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+				       latency_ms, ttft_ms, cost_nanos, pricing_status,
+				       CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.input_tokens'), 0) END AS raw_input_tokens,
+				       CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.output_tokens'), 0) END AS raw_output_tokens,
+				       CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.total_tokens'), 0) END AS raw_total_tokens,
+				       ` + eventStage1Cols + `
+				FROM usage_events ` + indexClause + `
+				WHERE ` + wherePredicate + `
+			)
+			SELECT *, ` + stagePromptFromPBCompExpr + ` AS _pr
+			FROM (
+				SELECT *, ` + stageCompFromPBExpr + ` AS _comp
+				FROM (
+					SELECT *, ` + stagePromptBaseExpr + ` AS _pb FROM s1
+				)
+			)
+		)`
+}
 
 // UsageDimension is one column a usage read can partition or narrow by.
 //
@@ -93,11 +268,20 @@ const (
 	// carries, so the provider label alone cannot say which configured provider
 	// answered.
 	UsageDimensionServingKey UsageDimension = "serving_key"
+	// UsageDimensionClientAgent is the normalised client program behind a
+	// generation request, `unknown` when its User-Agent named none. Client
+	// attribution is rolled up beside the request records rather than into the
+	// permanent facts, so a read that names it is a client read: it counts
+	// generation requests only and starts no earlier than the request-record
+	// horizon.
+	UsageDimensionClientAgent UsageDimension = "client_agent"
 )
 
 // usageDimensionExpressions maps a dimension to its SQL expression. The
 // expressions only use columns present on both the fact tables and usage_events;
-// model_alias is nullable on the latter, hence the COALESCE.
+// model_alias is nullable on the latter, hence the COALESCE. client_agent is the
+// exception: of the fact tables only the client ones carry it, which is why
+// naming it turns the read into a client read (see UsageFactQuery.isClientRead).
 var usageDimensionExpressions = map[UsageDimension]string{
 	UsageDimensionKey:        `api_group_key`,
 	UsageDimensionModel:      `model`,
@@ -106,6 +290,9 @@ var usageDimensionExpressions = map[UsageDimension]string{
 	UsageDimensionCredential: `TRIM(auth_index)`,
 	UsageDimensionAuthType:   `auth_type`,
 	UsageDimensionServingKey: `CASE WHEN auth_type = 'apikey' THEN TRIM(auth_index) ELSE '' END`,
+	// A request record without an attribution folds as "unknown", the label its
+	// client fact row carries.
+	UsageDimensionClientAgent: `CASE WHEN client_agent = '' THEN 'unknown' ELSE client_agent END`,
 }
 
 // UsageCalendarUnit is a civil bucket on the deployment's calendar.
@@ -129,11 +316,120 @@ type UsageCalendar struct {
 // TokenAccountingMeasures retain the scope of raw evidence alongside the
 // normalized sums. Requests not counted here are legacy, not known zero usage.
 type TokenAccountingMeasures struct {
-	CanonicalRequests  int64 `json:"canonical_requests"`
-	UnresolvedRequests int64 `json:"unresolved_requests"`
-	RawInputTokens     int64 `json:"raw_input_tokens"`
-	RawOutputTokens    int64 `json:"raw_output_tokens"`
-	RawTotalTokens     int64 `json:"raw_total_tokens"`
+	CanonicalRequests        int64 `json:"canonical_requests"`
+	UnresolvedRequests       int64 `json:"unresolved_requests"`
+	RawInputTokens           int64 `json:"raw_input_tokens"`
+	RawOutputTokens          int64 `json:"raw_output_tokens"`
+	RawTotalTokens           int64 `json:"raw_total_tokens"`
+	PromptTokens             int64 `json:"prompt_tokens"`
+	CompletionTokens         int64 `json:"completion_tokens"`
+	EffectiveCacheReadTokens int64 `json:"effective_cache_read_tokens"`
+	EffectiveTotalTokens     int64 `json:"effective_total_tokens"`
+}
+
+// EventPartitionInput holds the raw per-record fields used by NormalizeEventPartition.
+type EventPartitionInput struct {
+	IsCanonical         bool
+	Provider            string
+	ExecutorType        string
+	Endpoint            string
+	InputTokens         int64
+	OutputTokens        int64
+	ReasoningTokens     int64
+	CachedTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+	TotalTokens         int64
+}
+
+// NormalizeEventPartition is the pure Go equivalent of eventPromptExpr,
+// eventCompletionExpr, eventCacheReadExpr, and eventTotalExpr for single-record oracles.
+func NormalizeEventPartition(in EventPartitionInput) (promptTokens, completionTokens, effectiveCacheRead, effectiveTotal int64) {
+	rawInput := max(in.InputTokens, 0)
+	rawOutput := max(in.OutputTokens, 0)
+	total := max(in.TotalTokens, 0)
+	if in.IsCanonical {
+		promptTokens = rawInput
+		completionTokens = rawOutput
+		effectiveCacheRead = max(in.CacheReadTokens, 0)
+		effectiveTotal = max(total, promptTokens+completionTokens)
+		return
+	}
+	if in.CacheReadTokens > 0 {
+		effectiveCacheRead = in.CacheReadTokens
+	} else {
+		effectiveCacheRead = max(in.CachedTokens, 0)
+	}
+	cacheWrite := max(in.CacheCreationTokens, 0)
+	cacheTotal := effectiveCacheRead + cacheWrite
+	reasoning := max(in.ReasoningTokens, 0)
+	minComp := max(rawOutput, reasoning, 0)
+	sepComp := rawOutput + reasoning
+
+	semantics := resolveEventTokenSemantics(in.Provider, in.ExecutorType, in.Endpoint)
+
+	isDisjointInput := cacheTotal > 0 && rawInput > 0 && ((semantics == 2 && (in.CacheReadTokens > 0 || in.CacheCreationTokens > 0)) ||
+		(semantics == 0 && ((rawInput < cacheTotal && total <= rawInput+minComp) ||
+			(in.CachedTokens <= 0 && ((reasoning == 0 && total == rawInput+cacheTotal+minComp) ||
+				(reasoning > 0 && total == rawInput+cacheTotal+sepComp))))))
+
+	var promptBase int64
+	if isDisjointInput {
+		promptBase = rawInput + cacheTotal
+	} else {
+		promptBase = max(rawInput, cacheTotal)
+	}
+
+	if reasoning > 0 && rawOutput > 0 && (semantics == 3 || (semantics == 0 && total == promptBase+sepComp)) {
+		completionTokens = sepComp
+	} else {
+		completionTokens = minComp
+	}
+
+	if semantics == 0 && rawInput == 0 && cacheTotal == 0 && in.CachedTokens <= 0 && total > completionTokens {
+		promptTokens = total - completionTokens
+	} else {
+		promptTokens = promptBase
+	}
+	effectiveTotal = max(total, promptTokens+completionTokens)
+	return
+}
+
+// resolveEventTokenSemantics mirrors eventSemanticsCodeExpr and CPA's
+// tokenAccountingSemanticsFor: 1=subset, 2=independent, 3=separate_reasoning, 0=unknown.
+func resolveEventTokenSemantics(provider, executorType, endpoint string) int {
+	prov := strings.ToLower(strings.TrimSpace(provider))
+	exec := strings.ToLower(strings.TrimSpace(executorType))
+	if exec == "openaicompatexecutor" || prov == "openai-compatibility" || strings.HasPrefix(prov, "openai-compatible-") {
+		return 1
+	}
+	combined := strings.TrimSpace(prov + " " + exec)
+	if combined != "" && combined != "unknown" && combined != "unknown unknown" {
+		if strings.Contains(combined, "claude") || strings.Contains(combined, "anthropic") {
+			return 2
+		}
+		for _, m := range []string{"gemini", "aistudio", "antigravity", "vertex", "interaction"} {
+			if strings.Contains(combined, m) {
+				return 3
+			}
+		}
+		for _, m := range []string{"openai", "codex", "xai", "grok", "kimi", "qwen", "deepseek", "openrouter"} {
+			if strings.Contains(combined, m) {
+				return 1
+			}
+		}
+		return 0
+	}
+	switch {
+	case strings.Contains(endpoint, "/v1/messages"):
+		return 2
+	case strings.Contains(endpoint, ":generateContent") || strings.Contains(endpoint, ":streamGenerateContent"):
+		return 3
+	case strings.Contains(endpoint, "/chat/completions") || strings.Contains(endpoint, "/responses"):
+		return 1
+	default:
+		return 0
+	}
 }
 
 // UsageMeasures is the additive content of one fact row or one request record.
@@ -160,6 +456,10 @@ func (m *UsageMeasures) add(other UsageMeasures) {
 	m.Accounting.RawInputTokens += other.Accounting.RawInputTokens
 	m.Accounting.RawOutputTokens += other.Accounting.RawOutputTokens
 	m.Accounting.RawTotalTokens += other.Accounting.RawTotalTokens
+	m.Accounting.PromptTokens += other.Accounting.PromptTokens
+	m.Accounting.CompletionTokens += other.Accounting.CompletionTokens
+	m.Accounting.EffectiveCacheReadTokens += other.Accounting.EffectiveCacheReadTokens
+	m.Accounting.EffectiveTotalTokens += other.Accounting.EffectiveTotalTokens
 }
 
 // UsageFactQuery is one read of deployment usage.
@@ -179,6 +479,19 @@ type UsageFactQuery struct {
 	// Filters keep only rows whose dimension value is one of the listed values.
 	// An empty list for a dimension is no constraint.
 	Filters map[UsageDimension][]string
+	// ClientAgents keeps only the generation requests of these client programs.
+	// Client attribution is rolled up beside the request records and pruned with
+	// them, so such a read starts no earlier than the request-record horizon.
+	ClientAgents []string
+}
+
+// isClientRead reports whether the read is answered from the client facts:
+// it narrows to client programs or partitions by them.
+func (query UsageFactQuery) isClientRead() bool {
+	if len(query.ClientAgents) > 0 || len(query.Filters[UsageDimensionClientAgent]) > 0 {
+		return true
+	}
+	return slices.Contains(query.Dimensions, UsageDimensionClientAgent)
 }
 
 // UsageFactRow is one group's usage inside one bucket.
@@ -204,6 +517,12 @@ type UsageFactResult struct {
 	// request records, so a caller can say how much of a window was pre-aggregated.
 	FactRequests   int64
 	DetailRequests int64
+	// Clipped reports that a client read started at the request-record horizon
+	// rather than at the requested FromMS, and HorizonMS is that horizon. A window
+	// that ends before it reads nothing and keeps its requested bounds, so only
+	// HorizonMS says where attribution starts.
+	Clipped   bool
+	HorizonMS int64
 }
 
 // Totals sums every row of the read.
@@ -470,6 +789,18 @@ func (r *Repository) QueryUsageFacts(ctx context.Context, query UsageFactQuery) 
 	if err != nil {
 		return result, err
 	}
+	isClientRead := query.isClientRead()
+	if isClientRead && horizonMS > 0 && query.FromMS < horizonMS {
+		result.Clipped, result.HorizonMS = true, horizonMS
+		if query.ToMS < horizonMS {
+			result.FromMS, result.ToMS, result.BucketMS = query.FromMS, query.ToMS, query.BucketMS
+			if query.Calendar != nil {
+				result.BucketMS = 0
+			}
+			return result, nil
+		}
+		query.FromMS = horizonMS
+	}
 	var grid *calendarGrid
 	bucketMS := query.BucketMS
 	isDailyUsable := bucketMS == 0 || bucketMS%DayBucketMS == 0
@@ -485,7 +816,8 @@ func (r *Repository) QueryUsageFacts(ctx context.Context, query UsageFactQuery) 
 		isDailyUsable = query.Calendar.Unit != UsageCalendarHour && compiled.isZeroOffset()
 	}
 	plan := planUsageFactRead(horizonMS, query.FromMS, query.ToMS, bucketMS, isDailyUsable)
-	if grid != nil && !isDailyUsable && grid.unit != UsageCalendarHour {
+	// The local-day grain has no client counterpart; the fine table answers instead.
+	if grid != nil && !isDailyUsable && grid.unit != UsageCalendarHour && !isClientRead {
 		planLocalDays(&plan, grid.location)
 	}
 	hasLocalMarker := false
@@ -554,6 +886,8 @@ func fillUsageMeasureTargets(dst []any, measures *UsageMeasures) {
 	dst[12], dst[13], dst[14] = &measures.CostNanos, &measures.PricedRequests, &measures.CostedRequests
 	dst[15], dst[16] = &measures.Accounting.CanonicalRequests, &measures.Accounting.UnresolvedRequests
 	dst[17], dst[18], dst[19] = &measures.Accounting.RawInputTokens, &measures.Accounting.RawOutputTokens, &measures.Accounting.RawTotalTokens
+	dst[20], dst[21], dst[22] = &measures.Accounting.PromptTokens, &measures.Accounting.CompletionTokens, &measures.Accounting.EffectiveCacheReadTokens
+	dst[23] = &measures.Accounting.EffectiveTotalTokens
 }
 
 // ClientKeyFilter narrows a read to one client key fingerprint, or to nothing
@@ -606,11 +940,33 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 		keyNames = append(keyNames, name)
 	}
 	keySelect := ""
+	keyPass := ""
 	if len(keyColumns) > 0 {
 		keySelect = strings.Join(keyColumns, ", ") + ", "
+		keyPass = strings.Join(keyNames, ", ") + ", "
 	}
 
 	filterClause, filterArgs := usageFilterClause(query.Filters)
+	factFilter, eventFilter := filterClause, filterClause
+	fineTable, dailyTable := usageFactsFineTable, usageFactsDailyTable
+	factMeasures := strings.Join(usageFactMeasures, ", ")
+	if query.isClientRead() {
+		// Client facts count generation requests only and fold an unattributed one as
+		// "unknown", so the request-record arms read the same way. A fact row with an
+		// empty client_agent holds the non-generation requests, which carry no usage.
+		factFilter += " AND client_agent <> ''"
+		eventFilter += " AND generate = 1"
+		if len(query.ClientAgents) > 0 {
+			in := " IN (" + strings.TrimSuffix(strings.Repeat("?, ", len(query.ClientAgents)), ", ") + ")"
+			factFilter += " AND client_agent" + in
+			eventFilter += " AND " + usageDimensionExpressions[UsageDimensionClientAgent] + in
+			for _, agent := range query.ClientAgents {
+				filterArgs = append(filterArgs, agent)
+			}
+		}
+		fineTable, dailyTable = usageClientFactsFineTable, usageClientFactsDailyTable
+		factMeasures = usageClientFactProjection
+	}
 	withFilters := func(args ...any) []any { return append(args, filterArgs...) }
 
 	var parts []string
@@ -620,9 +976,9 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 			return
 		}
 		parts = append(parts, `
-			SELECT 1 AS from_facts, `+keySelect+aligned("bucket_start_ms")+` AS aligned, `+strings.Join(usageFactMeasures, ", ")+`
+			SELECT 1 AS from_facts, `+keySelect+aligned("bucket_start_ms")+` AS aligned, `+factMeasures+`
 			FROM `+table+`
-			WHERE instance_id = ? AND bucket_start_ms >= ? AND bucket_start_ms < ?`+filterClause)
+			WHERE instance_id = ? AND bucket_start_ms >= ? AND bucket_start_ms < ?`+factFilter)
 		args = append(args, withFilters(query.InstanceID, fromMS, toMS)...)
 	}
 	// Each arm over usage_events names its index. The planner cannot know that the
@@ -630,10 +986,7 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 	// and the wrong choice turns the dashboard's five-second poll into a scan of
 	// every retained record.
 	eventArm := func(index, predicate string, predicateArgs ...any) {
-		parts = append(parts, `
-			SELECT 0 AS from_facts, `+keySelect+aligned("timestamp_ms")+` AS aligned, `+usageEventMeasures+`
-			FROM usage_events INDEXED BY `+index+`
-			WHERE instance_id = ? AND `+predicate+filterClause)
+		parts = append(parts, buildStagedUsageEventsArm(keySelect, keyPass, aligned("timestamp_ms"), "INDEXED BY "+index, "instance_id = ? AND "+predicate+eventFilter))
 		args = append(args, withFilters(append([]any{query.InstanceID}, predicateArgs...)...)...)
 	}
 	const checkpoint = `(SELECT COALESCE((SELECT last_usage_event_id FROM usage_aggregation_checkpoints WHERE name = '` + CheckpointFacts + `'), 0))`
@@ -667,9 +1020,9 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 			args = append(args, plan.localMarker)
 		}
 	} else if plan.fineFrom < plan.fineTo {
-		factArm(usageFactsDailyTable, plan.dailyFrom, plan.dailyTo)
-		factArm(usageFactsFineTable, plan.fineFrom, plan.dailyFrom)
-		factArm(usageFactsFineTable, plan.dailyTo, plan.fineTo)
+		factArm(dailyTable, plan.dailyFrom, plan.dailyTo)
+		factArm(fineTable, plan.fineFrom, plan.dailyFrom)
+		factArm(fineTable, plan.dailyTo, plan.fineTo)
 	}
 	if plan.fineFrom < plan.fineTo {
 		// Folded records on the sub-bucket edges, which no whole fact bucket covers.
@@ -751,34 +1104,102 @@ func (r *Repository) AggregateUsageFacts(ctx context.Context, batchSize int) (in
 	}
 
 	measureColumns := strings.Join(usageFactMeasures, ", ")
+	clientMeasureColumns := strings.Join(usageClientFactMeasures, ", ")
+	if err := resetUsageStageBuffer(ctx, tx); err != nil {
+		return 0, err
+	}
+	defer func() { _, _ = tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_stage_15m`) }()
 	if err := resetUsageFoldBuffer(ctx, tx); err != nil {
 		return 0, err
 	}
 	defer func() { _, _ = tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_fold_15m`) }()
+	if err := resetClientUsageFoldBuffer(ctx, tx); err != nil {
+		return 0, err
+	}
+	defer func() { _, _ = tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_client_fold_15m`) }()
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO temp._omc_usage_fold_15m (instance_id, bucket_start_ms, `+usageFactDimensions+`, `+measureColumns+`)
-		SELECT instance_id, (timestamp_ms / ?1) * ?1, api_group_key, model, COALESCE(model_alias, ''),
-		       auth_index, provider, auth_type,
+		WITH s1 AS MATERIALIZED (
+			SELECT instance_id, (timestamp_ms / ?1) * ?1 AS bucket_start_ms,
+			       api_group_key, model, COALESCE(model_alias, '') AS model_alias,
+			       auth_index, provider, auth_type,
+			       generate,
+			       CASE WHEN generate = 1 THEN CASE WHEN client_agent = '' THEN 'unknown' ELSE client_agent END ELSE '' END AS client_agent,
+			       CASE WHEN generate = 1 THEN client_prefix ELSE '' END AS client_prefix,
+			       failed, input_tokens, output_tokens, reasoning_tokens,
+			       cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+			       latency_ms, ttft_ms, cost_nanos, pricing_status,
+			       CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.input_tokens'), 0) END AS raw_input_tokens,
+			       CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.output_tokens'), 0) END AS raw_output_tokens,
+			       CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.total_tokens'), 0) END AS raw_total_tokens,
+			       `+eventStage1Cols+`
+			FROM usage_events
+			WHERE id > ?2 AND id <= ?3
+		)
+		INSERT INTO temp._omc_usage_stage_15m (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, generate, `+measureColumns+`)
+		SELECT instance_id, bucket_start_ms, api_group_key, model, model_alias, auth_index, provider, auth_type,
+		       client_agent, client_prefix, generate,
 		       COUNT(1), SUM(failed), SUM(input_tokens), SUM(output_tokens), SUM(reasoning_tokens),
 		       SUM(cached_tokens), SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(total_tokens),
 		       SUM(latency_ms), SUM(COALESCE(ttft_ms, 0)), SUM(ttft_ms IS NOT NULL),
 		       SUM(COALESCE(cost_nanos, 0)), SUM(pricing_status = 'priced'), SUM(cost_nanos IS NOT NULL),
-		       SUM(CASE WHEN token_accounting IS NULL THEN 0 WHEN json_extract(token_accounting, '$.status') = 'complete' THEN 1 ELSE 0 END),
-		       SUM(CASE WHEN token_accounting IS NULL THEN 0 WHEN json_extract(token_accounting, '$.status') <> 'complete' THEN 1 ELSE 0 END),
-		       SUM(CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.input_tokens'), 0) END),
-		       SUM(CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.output_tokens'), 0) END),
-		       SUM(CASE WHEN token_accounting IS NULL THEN 0 ELSE COALESCE(json_extract(token_accounting, '$.raw_tokens.total_tokens'), 0) END)
-		FROM usage_events
-		WHERE id > ?2 AND id <= ?3
-		GROUP BY instance_id, (timestamp_ms / ?1) * ?1, api_group_key, model, COALESCE(model_alias, ''),
-		         auth_index, provider, auth_type`,
+		       SUM(_isc), SUM(_iur),
+		       SUM(raw_input_tokens), SUM(raw_output_tokens), SUM(raw_total_tokens),
+		       SUM(_pr), SUM(_comp), SUM(_cr), SUM(`+stageTotalExpr+`)
+		FROM (
+			SELECT *, `+stagePromptFromPBCompExpr+` AS _pr
+			FROM (
+				SELECT *, `+stageCompFromPBExpr+` AS _comp
+				FROM (
+					SELECT *, `+stagePromptBaseExpr+` AS _pb FROM s1
+				)
+			)
+		)
+		GROUP BY instance_id, bucket_start_ms, api_group_key, model, model_alias, auth_index, provider, auth_type, client_agent, client_prefix, generate`,
 		QuarterHourBucketMS, lastID, highID.Int64)
 	if err != nil {
 		return 0, fmt.Errorf("stage usage fold batch: %w", err)
 	}
 
+	factSums := make([]string, 0, len(usageFactMeasures))
+	for _, measure := range usageFactMeasures {
+		factSums = append(factSums, "SUM("+measure+")")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO temp._omc_usage_fold_15m (instance_id, bucket_start_ms, `+usageFactDimensions+`, `+measureColumns+`)
+		SELECT instance_id, bucket_start_ms, `+usageFactDimensions+`, `+strings.Join(factSums, ", ")+`
+		FROM temp._omc_usage_stage_15m
+		GROUP BY instance_id, bucket_start_ms, `+usageFactDimensions); err != nil {
+		return 0, fmt.Errorf("stage usage facts fold batch: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO temp._omc_usage_client_fold_15m (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+clientMeasureColumns+`)
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`,
+		       SUM(requests),
+		       SUM(CASE WHEN generate = 1 THEN requests ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN failures ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN prompt_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN completion_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN reasoning_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN effective_cache_read_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN cache_creation_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN effective_total_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN latency_sum_ms ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN ttft_sum_ms ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN ttft_count ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN cost_nanos ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN priced_requests ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN costed_requests ELSE 0 END)
+		FROM temp._omc_usage_stage_15m
+		GROUP BY instance_id, bucket_start_ms, `+usageClientFactDimensions); err != nil {
+		return 0, fmt.Errorf("stage client usage fold batch: %w", err)
+	}
+
 	if err := foldUsageBuffer(ctx, tx, minTS.Int64, maxTS.Int64); err != nil {
+		return 0, err
+	}
+	if err := foldClientUsageBuffer(ctx, tx); err != nil {
 		return 0, err
 	}
 
@@ -799,6 +1220,21 @@ func (r *Repository) AggregateUsageFacts(ctx context.Context, batchSize int) (in
 	return absorbed, nil
 }
 
+// resetUsageStageBuffer prepares the connection-local TEMP table that stages
+// one raw batch once before populating both usage_facts_* and usage_client_facts_*.
+func resetUsageStageBuffer(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS _omc_usage_stage_15m AS
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`, 0 AS generate, `+strings.Join(usageFactMeasures, ", ")+`
+		FROM `+usageFactsFineTable+`, (SELECT '' AS client_agent, '' AS client_prefix) WHERE 0`); err != nil {
+		return fmt.Errorf("prepare temp usage stage buffer: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_stage_15m`); err != nil {
+		return fmt.Errorf("reset temp usage stage buffer: %w", err)
+	}
+	return nil
+}
+
 // resetUsageFoldBuffer readies the connection-local TEMP table a fold stages its
 // 15-minute rows in. Because every civil UTC offset is a multiple of 15 minutes,
 // 15m, UTC-daily and local-daily all roll up from those rows.
@@ -811,6 +1247,55 @@ func resetUsageFoldBuffer(ctx context.Context, tx *sql.Tx) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_fold_15m`); err != nil {
 		return fmt.Errorf("reset temp usage fold buffer: %w", err)
+	}
+	return nil
+}
+
+// resetClientUsageFoldBuffer prepares the connection-local TEMP table that
+// stages 15-minute client attribution rows before folding into 15m and daily grains.
+func resetClientUsageFoldBuffer(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS _omc_usage_client_fold_15m AS
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+strings.Join(usageClientFactMeasures, ", ")+`
+		FROM `+usageClientFactsFineTable+` WHERE 0`); err != nil {
+		return fmt.Errorf("prepare temp client usage fold buffer: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_client_fold_15m`); err != nil {
+		return fmt.Errorf("reset temp client usage fold buffer: %w", err)
+	}
+	return nil
+}
+
+// foldClientUsageBuffer adds the staged 15-minute client attribution rows into
+// both usage_client_facts_15m and usage_client_facts_daily inside one transaction.
+func foldClientUsageBuffer(ctx context.Context, tx *sql.Tx) error {
+	updates := make([]string, 0, len(usageClientFactMeasures))
+	sums := make([]string, 0, len(usageClientFactMeasures))
+	for _, measure := range usageClientFactMeasures {
+		updates = append(updates, measure+" = "+measure+" + excluded."+measure)
+		sums = append(sums, "SUM("+measure+")")
+	}
+	updateSet := strings.Join(updates, ", ")
+	sumSelect := strings.Join(sums, ", ")
+	measureColumns := strings.Join(usageClientFactMeasures, ", ")
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO `+usageClientFactsFineTable+` (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+measureColumns+`)
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+measureColumns+`
+		FROM temp._omc_usage_client_fold_15m
+		WHERE true
+		ON CONFLICT DO UPDATE SET `+updateSet); err != nil {
+		return fmt.Errorf("fold usage into %s: %w", usageClientFactsFineTable, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO `+usageClientFactsDailyTable+` (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+measureColumns+`)
+		SELECT instance_id, (bucket_start_ms / ?1) * ?1, `+usageClientFactDimensions+`, `+sumSelect+`
+		FROM temp._omc_usage_client_fold_15m
+		GROUP BY instance_id, (bucket_start_ms / ?1) * ?1, `+usageClientFactDimensions+`
+		ON CONFLICT DO UPDATE SET `+updateSet,
+		DayBucketMS); err != nil {
+		return fmt.Errorf("fold usage into %s: %w", usageClientFactsDailyTable, err)
 	}
 	return nil
 }

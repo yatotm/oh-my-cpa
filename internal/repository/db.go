@@ -468,6 +468,14 @@ func migrationHook(version int) func(context.Context, *sql.Tx, *DB) error {
 		return addReleaseCheckTruncatedTx
 	case 56:
 		return restoreStructuredUsageTx
+	case 67:
+		return backfillUsageClientAgentsTx
+	case 68:
+		return repairUsageFactsPartitionsAndClientAgentTx
+	case 69:
+		return backfillAndRollupClientAttributionTx
+	case 70:
+		return repairCodexDesktopClientAgentTx
 	}
 	return nil
 }

@@ -6,13 +6,14 @@ import type {
   ConfigScalarsResponse,
   ConfigSourceResponse,
 } from '../types/configManagement';
-import type { CustomIcon } from '../types/customIcons';
+import { clearCustomIconAssignments, type CustomIcon } from '../types/customIcons';
 import type {
   ArchivedCredentialItem,
   ArchivedProviderItem,
   IdentityDirectoryResponse,
 } from '../types/identityDirectory';
 import { PROVIDER_ICONS_PREFERENCE, parseProviderIcons } from '../types/providerIcons';
+import { MODEL_ICONS_PREFERENCE, parseModelIcons } from '../types/modelIcons';
 import type { InstalledFont } from '../types/fonts';
 import type {
   ManagementAuthFile,
@@ -1745,6 +1746,9 @@ export async function interceptDemoRequest(
         credentials: mergedAuth,
         plugins: mergedPlugins,
         provider_icons: providerIcons,
+        model_icons: MODEL_ICONS_PREFERENCE in mergedPrefs
+          ? parseModelIcons(mergedPrefs[MODEL_ICONS_PREFERENCE])
+          : (baseDir?.model_icons ?? {}),
         archived_credentials: archivedCredentials,
         archived_providers: archivedProviders,
         catalog_status: {
@@ -2228,9 +2232,17 @@ export async function interceptDemoRequest(
             next.windows = next.windows.map((w) => ({ ...w, used_percent: 0, remaining_percent: 100 }));
             next.active_cooldown = undefined;
             next.quota_exceeded = false;
+            const nextCount = Math.max(0, next.reset_credits.available_count - redeemed);
+            const nextCredits = next.reset_credits.credits
+              ? [...next.reset_credits.credits]
+                  .sort((a, b) => (a.expires_at_ms ?? Number.MAX_SAFE_INTEGER) - (b.expires_at_ms ?? Number.MAX_SAFE_INTEGER))
+                  .slice(redeemed)
+              : undefined;
             next.reset_credits = {
               ...next.reset_credits,
-              available_count: Math.max(0, next.reset_credits.available_count - redeemed),
+              available_count: nextCount,
+              applicable_available_count: Math.min(next.reset_credits.applicable_available_count, nextCount),
+              ...(nextCredits !== undefined ? { credits: nextCredits } : {}),
             };
           }
           return next;
@@ -3744,6 +3756,24 @@ export async function interceptDemoRequest(
       if (!state.customIcons.deletedIds.includes(id)) state.customIcons.deletedIds.push(id);
       state.customIcons.created = state.customIcons.created.filter((i) => i.id !== id);
       delete state.customIcons.dataUrls[id];
+      const prefsBase = await ensureBaseline<{ preferences?: Record<string, unknown> }>(
+        'preferences',
+        '/preferences',
+        fetchBaseline,
+      );
+      const mergedPrefs = { ...(prefsBase?.preferences ?? {}), ...state.preferences };
+      if (PROVIDER_ICONS_PREFERENCE in mergedPrefs) {
+        const currentProviders = parseProviderIcons(mergedPrefs[PROVIDER_ICONS_PREFERENCE]);
+        if (Object.values(currentProviders).some((ref) => ref === `custom:${id}`)) {
+          state.preferences[PROVIDER_ICONS_PREFERENCE] = clearCustomIconAssignments(currentProviders, id);
+        }
+      }
+      if (MODEL_ICONS_PREFERENCE in mergedPrefs) {
+        const currentModels = parseModelIcons(mergedPrefs[MODEL_ICONS_PREFERENCE]);
+        if (Object.values(currentModels).some((ref) => ref === `custom:${id}`)) {
+          state.preferences[MODEL_ICONS_PREFERENCE] = clearCustomIconAssignments(currentModels, id);
+        }
+      }
       saveState(state);
       return jsonResponse({ status: 'ok' });
     }

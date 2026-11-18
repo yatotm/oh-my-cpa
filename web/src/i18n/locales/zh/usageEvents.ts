@@ -273,6 +273,7 @@ export default {
   'events.col_tokens': '消耗',
   'events.col_cache_rate': '缓存率',
   'events.col_key': 'Key',
+  'events.col_client': '客户端',
   'events.col_ua': 'UA',
   'events.col_resizer': '调整列宽 (可双击重置)',
   'events.reset_columns': '恢复默认列宽',
@@ -444,4 +445,5 @@ export default {
   'events.cause_upstream_hint': '上游内部出错。与当前配置无关时，通常会自行恢复。',
   'events.cause_unknown': '请求未成功',
   'events.cause_unknown_hint': '没有记录到明确的失败原因。可在诊断中查看上游响应和关联错误。',
+  'events.filter_chip_client_agent': '客户端: {val}',
 };

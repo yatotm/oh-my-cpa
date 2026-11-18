@@ -15,6 +15,7 @@ import {
   reconcileWirePatternRows,
   validatePatternRuleRows,
 } from '../../src/components/config/PatternRulesEditor.tsx';
+import { validateGoRe2Pattern } from '../../src/components/config/goRegex.ts';
 import { rebaseStringMapDraft, stringMapRowsToWire } from '../../src/components/config/StringMapEditor.tsx';
 import { writePayloadCategory } from '../../src/components/config/payloadRules.ts';
 import { ALL_CONFIG_FIELDS, CONFIG_GROUPS, type ConfigFieldDefinition } from '../../src/types/configSchema.ts';
@@ -1146,6 +1147,97 @@ test('findRe2PatternProblem and validatePatternRuleRows accept valid Go RE2 and 
   }
   assert.equal(findRe2PatternProblem('foo\\'), 'trailing_backslash');
 
+  for (const valid of [
+    '(?i)claude\\s+code',
+    '(?P<word>foo|bar)',
+    '\\Q(?=a)\\1\\E',
+    '\\\\1',
+    '\\0',
+    '\\12',
+    '\\123',
+    '\\777',
+    '\\123\\12',
+    '\\(?=a\\)',
+    '[(?=)]',
+    '[[:alpha:]]+',
+    '[]a]',
+    '[^]a]',
+    '(?<name>foo|bar)',
+    'a{1,2}?',
+    '\\Qunclosed',
+    '{01}',
+    'a{0,01}',
+    'a(?i)*',
+    'a*(?i)+',
+    '\\p{Han}',
+    '\\p{Cc}+',
+    '\\p{cntrl}+',
+    '\\p{Separator}+',
+    '\\p{Kawi}',
+    '\\p{Old_Italic}+',
+    '\\p{Uppercase-Letter}',
+    '\\p{Uppercase Letter}',
+    '\\p{^Uppercase_Letter}',
+    '\\pL',
+    '\\A\\b\\w+\\z',
+    '\\-',
+    '[A-[:]]',
+    '[A-[:alpha:]]',
+    '[a-]',
+    '(?:a{20}){40}',
+    '((a{100}){0}b){11}',
+    'a+\\Q\\E+',
+    '\\Qa\\E*',
+    `[${'[:'.repeat(200)}x]`,
+    'é',
+    '\\.',
+  ]) {
+    assert.equal(validateGoRe2Pattern(valid), null, valid);
+  }
+  for (const unsupported of [
+    'foo(?=bar)',
+    'foo(?!bar)',
+    '(?<=a)b',
+    '(?<!a)b',
+    '(a)\\1',
+    '\\18',
+    '\\80',
+    '\\9',
+    '(?>abc)',
+    '(?(1)a|b)',
+    '(?x)abc',
+    '\\u0041',
+    '\\Z',
+  ]) {
+    assert.equal(validateGoRe2Pattern(unsupported), 'unsupported_re2', unsupported);
+  }
+  for (const invalidSyntax of [
+    '\\(?=a)',
+    '(?i)*',
+    '\\q',
+    '\\E',
+    '[\\b]',
+    '\\p{123}',
+    '\\p{Leter}',
+    '\\p{Garay}',
+    '\\p{\u212Aawi}',
+    '\\Q\\E*',
+    '\\é',
+    '[z-a]',
+    '(?:a{40}){40}',
+    '(?:(?:a{1000}){0,}){2}',
+    '((a{100}){1}b){11}',
+    '(a{100}(b)){11}',
+    '((a{100})*b){11}',
+    '((a{100})+b){11}',
+    'a++',
+    '[unclosed',
+    'a{2,1}',
+  ]) {
+    assert.equal(validateGoRe2Pattern(invalidSyntax), 'invalid_syntax', invalidSyntax);
+  }
+  assert.equal(validateGoRe2Pattern('foo\\'), 'trailing_backslash');
+
   assert.deepEqual(validatePatternRuleRows([{ pattern: '', replacement: '' }]), {
     issue: null,
     rowErrors: [false],
@@ -1362,6 +1454,56 @@ test('antigravityTosPauseWindow sits in grp_antigravity_behavior, preserves omit
   assert.equal(getFieldSemanticValue(rebased, pauseField), 'disabled');
   assert.deepEqual(computeConfigChanges(parseDocument(newerYaml), rebased), [
     { path: ['oauth', 'providers', 'antigravity', 'tos-pause-window'], value: 'disabled' },
+  ]);
+});
+
+test('payloadReplaceRules schema registration, searchability, patch emission, and rebase preservation', () => {
+  const replaceField = field('payloadReplaceRules');
+  assert.equal(replaceField.sectionId, 'payload');
+  assert.deepEqual(replaceField.yamlPath, ['requests', 'payload', 'replace']);
+  assert.ok(replaceField.keywords?.includes('replace'));
+
+  const payloadGroup = CONFIG_GROUPS.find((group) => group.id === 'grp_payload_rules');
+  assert.ok(payloadGroup);
+  assert.ok(payloadGroup.fieldIds.includes('payloadReplaceRules'));
+
+  const server = parseDocument(SERVER_YAML);
+  const draft = server.clone();
+  const replaceValue = [
+    {
+      models: [{ name: '*', protocol: 'claude', 'from-protocol': 'openai' }],
+      target: { role: 'system', positions: [1, 2] },
+      replacements: [
+        { 'you are hero': 'you are fool' },
+        { pattern: '(?i)secret-(\\d+)', replacement: '[redacted-$1]' },
+        { 'remove this phrase': '' },
+      ],
+    },
+    {
+      models: [{ name: 'gpt-*', protocol: 'codex' }],
+      target: { paths: ['instructions', 'input.0.content'] },
+      replacements: [{ pattern: '^prefix:\\s*', replacement: '' }],
+    },
+  ];
+  writePayloadCategory(draft, 'replace', replaceValue);
+  assert.deepEqual(computeConfigChanges(server, draft), [
+    { path: ['requests', 'payload', 'replace'], value: replaceValue },
+  ]);
+
+  // Concurrent server update outside requests.payload.replace preserves the replace draft.
+  const newer = SERVER_YAML.replace('port: 8317', 'port: 9000');
+  const rebased = parseDocument(rebaseDraft(server, draft, newer) ?? '');
+  assert.equal(rebased.getIn(['server', 'port']), 9000);
+  assert.deepEqual(computeConfigChanges(parseDocument(newer), rebased), [
+    { path: ['requests', 'payload', 'replace'], value: replaceValue },
+  ]);
+
+  // Clearing replace emits removal when server previously held replace rules.
+  const populatedServer = parseDocument(draft.toString());
+  const clearedDraft = populatedServer.clone();
+  writePayloadCategory(clearedDraft, 'replace', []);
+  assert.deepEqual(computeConfigChanges(populatedServer, clearedDraft), [
+    { path: ['requests', 'payload', 'replace'], remove: true },
   ]);
 });
 

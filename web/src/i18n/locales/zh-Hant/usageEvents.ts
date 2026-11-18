@@ -276,6 +276,7 @@ export default {
   "events.col_tokens": "消耗",
   "events.col_cache_rate": "快取率",
   "events.col_key": "Key",
+  "events.col_client": "客戶端",
   "events.col_ua": "UA",
   "events.col_resizer": "調整列寬 (可雙擊重置)",
   "events.reset_columns": "恢復預設列寬",
@@ -447,4 +448,5 @@ export default {
   "events.cause_upstream_hint": "上游內部出錯。與目前設定無關時，通常會自行恢復。",
   "events.cause_unknown": "請求未成功",
   "events.cause_unknown_hint": "沒有記錄到明確的失敗原因。可在診斷中查看上游回應和關聯錯誤。",
+  "events.filter_chip_client_agent": "用戶端: {val}",
 } satisfies Translation<typeof source>;

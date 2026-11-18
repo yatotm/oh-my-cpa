@@ -23,6 +23,7 @@ import {
   loadDashboardPage,
   loadInsightsPage,
   loadAgentPage,
+  loadAuthorizePage,
   loadPlaygroundPage,
   loadModelSquarePage,
   loadLogsPage,
@@ -52,6 +53,7 @@ import {
   DEFAULT_MODEL_CHART_VIEW,
   parseModelChartView,
 } from './types/tokenDisplay';
+import { MODEL_VIEW_PREFERENCE } from './types/tokenDisplayContext';
 import { getAppConfig } from './types/config';
 
 function readCachedPreferences(ctx: RoutePrefetchContext): Record<string, unknown> | undefined {
@@ -62,7 +64,7 @@ async function prefetchDashboardData(ctx: RoutePrefetchContext): Promise<void> {
   const prefs = readCachedPreferences(ctx);
   if (!prefs) return;
   const range = parseDashboardRange(prefs[DASHBOARD_RANGE_PREFERENCE]) ?? DEFAULT_DASHBOARD_RANGE;
-  const modelView = parseModelChartView(prefs.omc_model_chart_view) ?? DEFAULT_MODEL_CHART_VIEW;
+  const modelView = parseModelChartView(prefs[MODEL_VIEW_PREFERENCE]) ?? DEFAULT_MODEL_CHART_VIEW;
   const query = dashboardRangeParams(range);
   await Promise.allSettled([
     dashboardWindowSwr.prefetch(ctx.queryClient, query),
@@ -117,7 +119,7 @@ export const ROUTE_DESCRIPTORS: readonly RouteDescriptor[] = [
   {
     path: '/insights',
     priority: 'high',
-    loadingBody: 'panels',
+    loadingBody: 'insights',
     preloadChunk: () => Promise.all([loadInsightsPage(), preloadInsightsCharts()]),
     prefetchData: prefetchInsightsData,
   },
@@ -131,27 +133,28 @@ export const ROUTE_DESCRIPTORS: readonly RouteDescriptor[] = [
   {
     path: '/logs',
     priority: 'high',
-    loadingBody: 'table',
+    loadingBody: 'logs',
     preloadChunk: loadLogsPage,
   },
-  { path: '/ai-providers', priority: 'normal', preloadChunk: loadProvidersPage },
-  { path: '/api-keys', priority: 'normal', preloadChunk: loadApiKeysPage },
-  { path: '/routing', priority: 'normal', loadingBody: 'panels', preloadChunk: loadRoutingPage },
-  { path: '/oauth-management', priority: 'normal', preloadChunk: loadOAuthManagementPage },
-  { path: '/auth-files', priority: 'normal', preloadChunk: loadLegacyOAuthManagementRedirect },
-  { path: '/oauth', priority: 'normal', preloadChunk: loadLegacyOAuthManagementRedirect },
-  { path: '/quota', priority: 'normal', preloadChunk: loadLegacyOAuthManagementRedirect },
-  { path: '/model-square', priority: 'normal', preloadChunk: loadModelSquarePage },
+  { path: '/ai-providers', priority: 'normal', loadingBody: 'directory', preloadChunk: loadProvidersPage },
+  { path: '/api-keys', priority: 'normal', loadingBody: 'directory', preloadChunk: loadApiKeysPage },
+  { path: '/routing', priority: 'normal', loadingBody: 'routing', preloadChunk: loadRoutingPage },
+  { path: '/oauth-management', priority: 'normal', loadingBody: 'fleet', preloadChunk: loadOAuthManagementPage },
+  { path: '/auth-files', priority: 'normal', loadingBody: 'fleet', preloadChunk: loadLegacyOAuthManagementRedirect },
+  { path: '/oauth', priority: 'normal', loadingBody: 'fleet', preloadChunk: loadLegacyOAuthManagementRedirect },
+  { path: '/quota', priority: 'normal', loadingBody: 'fleet', preloadChunk: loadLegacyOAuthManagementRedirect },
+  { path: '/model-square', priority: 'normal', loadingBody: 'catalog', preloadChunk: loadModelSquarePage },
   { path: '/agent', priority: 'normal', loadingBody: 'workspace', preloadChunk: loadAgentPage },
   { path: '/playground', priority: 'normal', loadingBody: 'workspace', preloadChunk: loadPlaygroundPage },
-  { path: '/audit', priority: 'normal', loadingBody: 'table', preloadChunk: loadAuditPage },
-  { path: '/config', priority: 'normal', loadingBody: 'panels', preloadChunk: loadConfigPage },
-  { path: '/omc-settings', priority: 'normal', loadingBody: 'panels', preloadChunk: loadOmcSettingsPage },
-  { path: '/system', priority: 'normal', loadingBody: 'panels', preloadChunk: loadSystemPage },
-  { path: '/plugins', priority: 'normal', preloadChunk: loadPluginsPage },
-  { path: '/plugins/store', priority: 'normal', preloadChunk: loadPluginsPage },
-  { path: '/plugins/settings', priority: 'normal', preloadChunk: loadPluginsPage },
-  { path: '/plugin-pages/', matchPrefix: true, priority: 'normal', preloadChunk: loadPluginPageHost },
+  { path: '/audit', priority: 'normal', loadingBody: 'directory', preloadChunk: loadAuditPage },
+  { path: '/config', priority: 'normal', loadingBody: 'workbench', preloadChunk: loadConfigPage },
+  { path: '/omc-settings', priority: 'normal', loadingBody: 'settings', preloadChunk: loadOmcSettingsPage },
+  { path: '/system', priority: 'normal', loadingBody: 'system', preloadChunk: loadSystemPage },
+  { path: '/plugins', priority: 'normal', loadingBody: 'plugins', preloadChunk: loadPluginsPage },
+  { path: '/plugins/store', priority: 'normal', loadingBody: 'plugins-store', preloadChunk: loadPluginsPage },
+  { path: '/plugins/settings', priority: 'normal', loadingBody: 'plugins-settings', preloadChunk: loadPluginsPage },
+  { path: '/plugin-pages/', matchPrefix: true, priority: 'normal', loadingBody: 'frame', preloadChunk: loadPluginPageHost },
+  { path: '/authorize/', matchPrefix: true, priority: 'normal', loadingBody: 'authorize', preloadChunk: loadAuthorizePage },
 ];
 
 export const consoleRouteRegistry = createRouteRegistry(ROUTE_DESCRIPTORS);

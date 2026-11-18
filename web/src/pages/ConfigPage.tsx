@@ -3,8 +3,8 @@ import { MetaLine } from '../components/common/MetaLine';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Segmented } from '@/components/ui/segmented';
-import { ParagraphPlaceholder } from '../components/common/ContentPlaceholder';
-import { SuspenseFallback } from '../components/common/PageLoading';
+import { CodeLinesPlaceholder } from '../components/common/ContentPlaceholder';
+import { SuspenseFallback, WorkbenchSkeleton } from '../components/common/PageLoading';
 import {
   AppstoreOutlined,
   ArrowLeftOutlined,
@@ -47,7 +47,6 @@ import { SearchInput } from '../components/common/SearchInput';
 import { SectionHeading } from '../components/common/SectionHeading';
 import { Tag } from '../components/common/Tag';
 import { ConfirmAction } from '../components/common/ConfirmAction';
-import { Panel } from '../components/common/Panel';
 import { CopyButton } from '../components/common/CopyButton';
 import { ToolButton } from '../components/common/ToolButton';
 import '../components/config/config.css';
@@ -91,12 +90,14 @@ export const ConfigPage: React.FC = () => {
     saveMutation,
     showErrorFeedback,
     handleDiscardChanges,
-    payloadIssues,
+    blockingPayloadIssuesCount,
     stringMapIssues,
     patternRulesIssues,
     firstFieldErrorMessage,
     hasYamlErrors,
     hasConfigErrors,
+    hasPendingPayloadEdits,
+    saveConfirmDescription,
     saveConfig,
     requestSaveConfirmation,
     handleViewModeChange,
@@ -242,10 +243,13 @@ export const ConfigPage: React.FC = () => {
     for (const fieldId of Object.keys(patternRulesIssues)) {
       changed.add(fieldId);
     }
+    if (hasPendingPayloadEdits) {
+      changed.add('payloadReplaceRules');
+    }
     return changed;
     // rawYaml is the draft's revision: the refs are rewritten before it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isDirty, rawYaml, docRef, serverDocRef, stringMapIssues, patternRulesIssues]);
+  }, [isDirty, rawYaml, docRef, serverDocRef, stringMapIssues, patternRulesIssues, hasPendingPayloadEdits]);
   const changedSectionIds = React.useMemo(
     () => new Set(ALL_CONFIG_FIELDS.filter((field) => changedFieldIds.has(field.id)).map((field) => field.sectionId)),
     [changedFieldIds],
@@ -404,7 +408,7 @@ export const ConfigPage: React.FC = () => {
               ) : (
                 <ConfirmAction
                   title={t('cfg.source_save_confirm')}
-                  description={t('cfg.source_save_confirm_desc')}
+                  description={saveConfirmDescription}
                   onConfirm={saveConfig}
                   disabled={!isDirty || saveMutation.isPending}
                 >
@@ -440,9 +444,9 @@ export const ConfigPage: React.FC = () => {
       )}
 
       {configQuery.isPending && !rawYaml ? (
-        <Panel className="config-card config-shell-band">
-          <ParagraphPlaceholder rows={10} />
-        </Panel>
+        <div className="config-shell-band">
+          <WorkbenchSkeleton hasHeader={false} />
+        </div>
       ) : configQuery.isError && !rawYaml ? (
         <LoadFailure
           className="config-shell-band"
@@ -573,7 +577,7 @@ export const ConfigPage: React.FC = () => {
             <React.Suspense
               fallback={
                 <SuspenseFallback>
-                  <ParagraphPlaceholder rows={14} className="config-monaco-loading" />
+                  <CodeLinesPlaceholder rows={14} className="config-monaco-loading" />
                 </SuspenseFallback>
               }
             >
@@ -615,9 +619,10 @@ export const ConfigPage: React.FC = () => {
         isDirty={isDirty}
         isSaving={saveMutation.isPending}
         yamlError={hasYamlErrors}
-        payloadIssuesCount={payloadIssues.length}
+        payloadIssuesCount={blockingPayloadIssuesCount}
         validationError={firstFieldErrorMessage}
         showErrorFeedback={showErrorFeedback}
+        confirmDescription={saveConfirmDescription}
         onSave={saveConfig}
         onDiscard={handleDiscardChanges}
       />

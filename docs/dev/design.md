@@ -388,9 +388,11 @@ separators or by stacking ad-hoc `<div>` lines.
   banner and dialog.
 - Initial absence can use a skeleton. Refreshing existing data should retain the data
   and its geometry, with a local activity indicator.
-- A route names the body its loading frame draws (`loadingAs` in `App.tsx`; the bodies
-  are in `PageLoading.tsx`). A page's first read keeps its real head and draws that same
-  body, so the download frame, the first-read frame and the content land in one place.
+- A route declares its loading archetype via `loadingBody` in `ROUTE_DESCRIPTORS`
+  (`routePreload.ts`), and `PAGE_SKELETON_REGISTRY` in `PageLoading.tsx` renders it
+  consistently across shell boot (`ShellLoading.tsx`) and lazy route chunks (`AppLayout.tsx`).
+  A page's first read keeps its real head and draws that same body, so the shell frame,
+  download frame, first-read frame, and content land in one place.
 - A progress estimate is not elapsed-time truth. Do not invent a time remaining or an
   exact accessibility percentage for work whose total cannot be measured.
 
@@ -418,9 +420,16 @@ Motion measures `auto` in the state it is heading for, so padding folding alongs
 the motion short of its end and snap the rest.
 
 Charts are the exception. A chart's marks are hundreds of SVG nodes, so a new dataset is rendered
-once inside an element-scoped view transition ([`useChartMorph`](../../web/src/charts/useChartMorph.ts))
-that cross-fades the chart on the compositor, and the chart library's own tween stays off. Where
-scoped transitions are missing or motion is reduced, the new data simply lands.
+once inside an element-scoped view transition
+([`useChartMorph`](../../web/src/charts/useChartMorph.ts)) that cross-fades the chart on the
+compositor, and the chart library's own tween stays off. Where motion is reduced the new data simply
+lands, and so does a cross-fade where scoped transitions are missing. A stacked bar chart whose next
+drawing keeps its buckets and some of its series (a series picked out of the stack, a legend toggle,
+another metric, a revision) glides instead ([`barGlide`](../../web/src/charts/barGlide.tsx)): each
+segment drawn on both sides travels from its old box to its new one on one Web Animations transform,
+an arriving segment fades in where it belongs once the others are nearly home, and a leaving one
+goes at once, so the reader sees the same bars change rather than one picture replace another.
+Another grouping, window or bucket size, or more segments than a frame can move, still cross-fades.
 
 The request list is the other exception. Its rows are virtualized and placed by transforms the list
 owns, so a record arriving at the live edge is carried in by the list itself
@@ -452,7 +461,9 @@ that arrives on its own - a finished step, an outcome, a status - settles in on 
 without an overshoot. A card under the pointer rises in shadow and never travels.
 A route settles in rather than swapping: the page frame fades in over a 4px rise
 (`route-enter`), a list or table arriving inside a page that is already standing only fades, and
-a loading placeholder waits 120ms before it shows, so a fast answer never flashes a skeleton. A card the
+a standalone loading placeholder waits 120ms before it shows so a fast answer never flashes a
+skeleton, whereas active loading handovers skip the delay and synchronize their breathing phase
+across phases. A card the
 reader chooses presses in by `--press-scale` (0.99) under the pointer and settles into its
 selected state on `--select-transition` (`--motion-base`, `--ease-out`): felt, not watched, with
 no spring.

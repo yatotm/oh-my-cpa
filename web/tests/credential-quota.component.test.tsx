@@ -7,6 +7,15 @@ import {
   CredentialQuotaPanel,
   type CredentialQuotaPanelProps,
 } from '../src/components/dashboard/CredentialQuota';
+import {
+  ModelPanelsProvider,
+  ModelTrendPanel,
+  ModelUsagePanel,
+} from '../src/components/dashboard/ModelUsagePanels';
+import { TokenHeatmap } from '../src/components/dashboard/TokenHeatmap';
+import { ThemeProvider } from '../src/theme/ThemeContext';
+import { TokenDisplayProvider } from '../src/types/tokenDisplayContext';
+import { CurrencyDisplayProvider } from '../src/types/CurrencyDisplayContext';
 import { buildCredentialQuotaBoard, credentialQuotaRefreshTargets } from '../src/components/dashboard/credentialQuotaLogic';
 import { resolveCredentialMark } from '../src/types/brandMark';
 import { CredentialQuotaBody } from '../src/pages/quota/CredentialQuotaBody';
@@ -228,6 +237,120 @@ describe('credential quota body details', () => {
     expect(screen.getByText(/Last refresh failed/)).toBeTruthy();
     expect(screen.getAllByText(/HTTP 401: unauthorized/).length).toBeGreaterThan(0);
     expect(screen.getByText('100%')).toBeTruthy();
+  });
+
+  it('lists every Codex reset credit in expiry order instead of only the earliest one', () => {
+    const onRedeem = vi.fn();
+    const { rerender } = render(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: {
+                available_count: 3,
+                applicable_available_count: 1,
+                credits: [
+                  { id: 'c-3', status: 'available', expires_at_ms: NOW_MS + 20 * 24 * HOUR_MS },
+                  { id: 'c-1', status: 'available', expires_at_ms: NOW_MS + 3 * 24 * HOUR_MS },
+                  { id: 'c-2', status: 'available', expires_at_ms: NOW_MS + 10 * 24 * HOUR_MS },
+                ],
+              },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+
+    const card = document.querySelector<HTMLElement>('[data-quota-reset="credits"]')!;
+    expect(card).toBeTruthy();
+    expect(within(card).getByText('Reset credits')).toBeTruthy();
+    expect(within(card).getByText('3')).toBeTruthy();
+    expect(within(card).getByText('Applicable 1')).toBeTruthy();
+
+    const rows = Array.from(card.querySelectorAll<HTMLElement>('[data-quota-reset-credit]'));
+    expect(rows.map((row) => row.getAttribute('data-quota-reset-credit'))).toEqual(['c-1', 'c-2', 'c-3']);
+    expect(rows[0].textContent).toContain('Credit #1');
+    expect(rows[0].textContent).toContain('3d left');
+    expect(rows[1].textContent).toContain('Credit #2');
+    expect(rows[1].textContent).toContain('10d left');
+    expect(rows[2].textContent).toContain('Credit #3');
+    expect(rows[2].textContent).toContain('20d left');
+    expect(within(card).getByRole('button', { name: 'Reset quota' })).toBeTruthy();
+
+    // Also retains stale/expired and undated entries when available_count > 0, and stays clean when credits list is absent.
+    rerender(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: {
+                available_count: 2,
+                applicable_available_count: 2,
+                credits: [
+                  { id: 'c-expired', status: 'available', expires_at_ms: NOW_MS - HOUR_MS },
+                  { id: 'c-undated', status: 'available' },
+                ],
+              },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+    const staleRows = Array.from(document.querySelectorAll<HTMLElement>('[data-quota-reset-credit]'));
+    expect(staleRows).toHaveLength(2);
+    expect(staleRows[0].querySelector('[data-expired="true"]')?.textContent).toMatch(/^Expired /);
+    expect(staleRows[1].textContent).toContain('—');
+
+    rerender(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: { available_count: 2, applicable_available_count: 2 },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+    expect(document.querySelector('[data-quota-reset="credits"]')).toBeTruthy();
+    expect(document.querySelector('[data-quota-reset-list="credits"]')).toBeNull();
+
+    rerender(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: {
+                available_count: 0,
+                applicable_available_count: 0,
+                credits: [{ id: 'c-stale', status: 'available', expires_at_ms: NOW_MS + HOUR_MS }],
+              },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+    expect(document.querySelector('[data-quota-reset="credits"]')).toBeNull();
   });
 
 });
@@ -545,5 +668,196 @@ describe('quota consumption and window capacity dialog', () => {
         expect(capacityCard.textContent).not.toContain('123');
       });
     } finally { view.unmount(); }
+  });
+});
+
+describe('dashboard model panels and heatmap alignment states', () => {
+  it('omits the trend legend when models are empty and mounts it once models exist', async () => {
+    const api = installOmcApi();
+    let modelsPayload = {
+      window: { from: NOW_MS - HOUR_MS, to: NOW_MS, bucket_ms: 60_000, minutes: 60 },
+      total_tokens: 0,
+      models: [] as Array<{
+        model: string;
+        tokens: number;
+        requests: number;
+        priced_requests: number;
+        cost_usd: number | null;
+        buckets: number[];
+      }>,
+    };
+    api.on('GET', '/management/dashboard/models', () => modelsPayload);
+
+    const view = renderWithOmc(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TokenDisplayProvider>
+            <CurrencyDisplayProvider>
+              <ModelPanelsProvider>
+                <ModelTrendPanel query="preset=1h" range={{ preset: '1h' }} enabled />
+                <ModelUsagePanel query="preset=1h" range={{ preset: '1h' }} enabled />
+              </ModelPanelsProvider>
+            </CurrencyDisplayProvider>
+          </TokenDisplayProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+
+    try {
+      await waitFor(() => {
+        expect(screen.getAllByText(makeT('en')('dash.models.empty'))).toHaveLength(2);
+      });
+      expect(screen.queryByTestId('model-trend-legend')).toBeNull();
+
+      modelsPayload = {
+        window: { from: NOW_MS - HOUR_MS, to: NOW_MS, bucket_ms: 60_000, minutes: 60 },
+        total_tokens: 1200,
+        models: [
+          {
+            model: 'gpt-5',
+            tokens: 1200,
+            requests: 4,
+            priced_requests: 4,
+            cost_usd: 0.12,
+            buckets: [400, 800],
+          },
+        ],
+      };
+
+      const nextView = renderWithOmc(
+        <MemoryRouter>
+          <ThemeProvider>
+            <TokenDisplayProvider>
+              <CurrencyDisplayProvider>
+                <ModelPanelsProvider>
+                  <ModelTrendPanel query="preset=24h" range={{ preset: '24h' }} enabled />
+                  <ModelUsagePanel query="preset=24h" range={{ preset: '24h' }} enabled />
+                </ModelPanelsProvider>
+              </CurrencyDisplayProvider>
+            </TokenDisplayProvider>
+          </ThemeProvider>
+        </MemoryRouter>,
+      );
+
+      try {
+        const legend = await within(nextView.container).findByTestId('model-trend-legend');
+        const toggle = within(legend).getByRole('button', { name: /gpt-5/ });
+        expect(toggle.getAttribute('aria-pressed')).toBe('false');
+        fireEvent.click(toggle);
+        expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      } finally {
+        nextView.unmount();
+      }
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('switches both cards to the client lens from the usage card title and back', async () => {
+    const api = installOmcApi();
+    const window = { from: NOW_MS - HOUR_MS, to: NOW_MS, bucket_ms: 60_000, minutes: 60 };
+    const group = (model: string, extra: Record<string, unknown> = {}) => ({
+      model, folded: false, tokens: 1200, requests: 4, priced_requests: 4, cost_usd: 0.12,
+      series: [{ t: NOW_MS - 60_000, tokens: 1200 }], ...extra,
+    });
+    api.on('GET', '/management/dashboard/models', (request) => ({
+      window,
+      total_tokens: 1200,
+      models: [
+        request.query.get('group_by') === 'client' ? group('claude-code', { category: 'agent' }) : group('gpt-5'),
+        group('', { folded: true }),
+      ],
+      partial_errors: [],
+    }));
+    const t = makeT('en');
+
+    const view = renderWithOmc(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TokenDisplayProvider>
+            <CurrencyDisplayProvider>
+              <ModelPanelsProvider>
+                <ModelTrendPanel query="preset=1h" range={{ preset: '1h' }} enabled />
+                <ModelUsagePanel query="preset=1h" range={{ preset: '1h' }} enabled />
+              </ModelPanelsProvider>
+            </CurrencyDisplayProvider>
+          </TokenDisplayProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    try {
+      const legend = await screen.findByTestId('model-trend-legend');
+      fireEvent.click(within(legend).getByRole('button', { name: /gpt-5/ }));
+      expect(screen.getByRole('radiogroup', { name: t('dash.models.view_toggle_label') })).toBeTruthy();
+
+      fireEvent.click(screen.getByRole('tab', { name: t('dash.models.lens_clients') }));
+      // The model ranking stays on screen, and clickable, until the client one lands. A choice made
+      // in it belongs to the models, even where the client ranking has a group of the same key.
+      fireEvent.click(within(screen.getByTestId('model-trend-legend')).getByRole('button', { name: t('dash.models.folded') }));
+      const clientEntry = await waitFor(() => within(screen.getByTestId('model-trend-legend')).getByRole('button', { name: /Claude Code/ }));
+      expect(clientEntry.getAttribute('aria-pressed')).toBe('false');
+      expect(within(screen.getByTestId('model-trend-legend')).getByRole('button', { name: t('dash.clients.folded') }).getAttribute('aria-pressed')).toBe('false');
+      expect(screen.queryByRole('radiogroup', { name: t('dash.models.view_toggle_label') })).toBeNull();
+      expect(api.requests.some((request) => request.query.get('group_by') === 'client')).toBe(true);
+
+      fireEvent.click(screen.getByRole('tab', { name: t('dash.models.lens_models') }));
+      await waitFor(() => expect(screen.getAllByText('gpt-5').length).toBeGreaterThan(0));
+      expect(screen.getByRole('radiogroup', { name: t('dash.models.view_toggle_label') })).toBeTruthy();
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('speaks for the chosen lens when its read fails with no ranking held', async () => {
+    const api = installOmcApi();
+    api.on('GET', '/management/dashboard/models', () => {
+      throw new Error('models unavailable');
+    });
+    const t = makeT('en');
+
+    const view = renderWithOmc(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TokenDisplayProvider>
+            <CurrencyDisplayProvider>
+              <ModelPanelsProvider>
+                <ModelUsagePanel query="preset=1h" range={{ preset: '1h' }} enabled />
+              </ModelPanelsProvider>
+            </CurrencyDisplayProvider>
+          </TokenDisplayProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    try {
+      await within(view.container).findByText(t('dash.models.error'));
+      fireEvent.click(screen.getByRole('tab', { name: t('dash.models.lens_clients') }));
+      await within(view.container).findByText(t('dash.clients.error'));
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('keeps the heatmap header wrapper mounted when the first heatmap read fails', async () => {
+    const api = installOmcApi();
+    api.on('GET', '/management/dashboard/token-heatmap', () => {
+      throw new Error('heatmap unavailable');
+    });
+
+    const view = renderWithOmc(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TokenDisplayProvider>
+            <TokenHeatmap />
+          </TokenDisplayProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+
+    try {
+      await within(view.container).findByText(makeT('en')('dash.heatmap.error'));
+      expect(view.container.querySelector('.heatmap-inner > .heatmap-head')).not.toBeNull();
+    } finally {
+      view.unmount();
+    }
   });
 });

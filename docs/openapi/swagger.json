@@ -4642,7 +4642,7 @@
             "CookieAuth": []
           }
         ],
-        "description": "Return token, request, and cost breakdown grouped by upstream model or client call point.",
+        "description": "Return token, request, and cost breakdown grouped by upstream model, client call point, or client program.",
         "produces": [
           "application/json"
         ],
@@ -4678,7 +4678,8 @@
           {
             "enum": [
               "model",
-              "call"
+              "call",
+              "client"
             ],
             "type": "string",
             "description": "Grouping mode",
@@ -4940,6 +4941,119 @@
         }
       }
     },
+    "/v1/management/insights/clients": {
+      "get": {
+        "security": [
+          {
+            "CookieAuth": []
+          }
+        ],
+        "description": "Aggregate retained request records in the Insights window by normalized client agent or SDK family under optional Insights dimension filters.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "Insights"
+        ],
+        "summary": "Query client and agent attribution for Insights",
+        "parameters": [
+          {
+            "type": "string",
+            "description": "Insights time preset (today, yesterday, this_week, last_week, this_month, last_month, 24h, 7d, 30d, 90d, all)",
+            "name": "preset",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "Custom window start timestamp in Unix milliseconds",
+            "name": "from",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "Custom window end timestamp in Unix milliseconds",
+            "name": "to",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Client API key or hmac fingerprint filters",
+            "name": "api_key",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Upstream model filters",
+            "name": "model",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Call point filters",
+            "name": "model_alias",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Provider filters",
+            "name": "provider",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Credential auth_index filters",
+            "name": "auth_index",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/api.insightsClientsResponse"
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          }
+        }
+      }
+    },
     "/v1/management/insights/cube": {
       "get": {
         "security": [
@@ -4978,6 +5092,16 @@
             "type": "string",
             "description": "Comparison window mode",
             "name": "compare",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Client program filters; the window then starts no earlier than request-record retention",
+            "name": "client_agent",
             "in": "query"
           }
         ],
@@ -5091,6 +5215,16 @@
             "collectionFormat": "multi",
             "description": "Credential auth_index filters",
             "name": "auth_index",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Client program filters; the window then starts no earlier than request-record retention",
+            "name": "client_agent",
             "in": "query"
           }
         ],
@@ -12323,6 +12457,16 @@
             "description": "Credential auth_index filters",
             "name": "auth_index",
             "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "Normalized client agent or SDK family filters",
+            "name": "client_agent",
+            "in": "query"
           }
         ],
         "responses": {
@@ -14196,6 +14340,12 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/api.IdentityCredentialDTO"
+          }
+        },
+        "model_icons": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
           }
         },
         "plugins": {
@@ -17004,6 +17154,18 @@
         "auth_type": {
           "type": "string"
         },
+        "client_agent": {
+          "type": "string"
+        },
+        "client_agent_category": {
+          "description": "the glyph for a client without brand artwork",
+          "type": "string",
+          "enum": [
+            "agent",
+            "sdk",
+            "unknown"
+          ]
+        },
         "client_ip": {
           "type": "string"
         },
@@ -17840,6 +18002,15 @@
     "api.dashboardModelUsage": {
       "type": "object",
       "properties": {
+        "category": {
+          "description": "Category is the client program's kind (agent, sdk or unknown), sent in\nthe client view only so the panel can draw a glyph for a client without\nits own mark.",
+          "type": "string",
+          "enum": [
+            "agent",
+            "sdk",
+            "unknown"
+          ]
+        },
         "cost_usd": {
           "description": "CostUSD is the group's priced spend at request-time prices. It is null\nrather than zero when the group carried no priced request, so a client\ncan tell \"unpriced\" from \"free\" the way the cost tile already does.",
           "type": "number"
@@ -17849,7 +18020,7 @@
           "type": "boolean"
         },
         "model": {
-          "description": "Model is the group's key, meaningful only when Folded is false. In the\nmodel view it is the upstream model name; in the call view it is the call\npoint: the client-requested alias, or the upstream model when no alias\nwas requested.",
+          "description": "Model is the group's key, meaningful only when Folded is false. In the\nmodel view it is the upstream model name; in the call view it is the call\npoint: the client-requested alias, or the upstream model when no alias\nwas requested; in the client view it is the client program's identifier.",
           "type": "string"
         },
         "priced_requests": {
@@ -17874,6 +18045,10 @@
     "api.dashboardModelsResponse": {
       "type": "object",
       "properties": {
+        "covered_from": {
+          "description": "CoveredFromMS is set when the client view starts later than the window:\nclient attribution is kept only as long as the request records, so the\ngroups and their series begin at that horizon instead of at window.from.\nIt falls after window.to when the whole window predates the horizon.",
+          "type": "integer"
+        },
         "models": {
           "description": "Models is ranked by token volume, descending, with the folded group last.",
           "type": "array",
@@ -18010,8 +18185,11 @@
     "api.dashboardSeriesPoint": {
       "type": "object",
       "properties": {
+        "cache_rate": {
+          "type": "number"
+        },
         "cache_read": {
-          "description": "CacheReadTokens and CostNanos are per-bucket, so the cache-rate and cost\ntiles can plot their own series instead of repeating the token volume.\nNanos rather than a float keeps the wire value exact; the browser scales it.",
+          "description": "CacheReadTokens, CacheRate and CostNanos are per-bucket, so the cache-rate\nand cost tiles can plot their own series instead of repeating the token volume.\nNanos rather than a float keeps the wire value exact; the browser scales it.\nCacheRate is nil (omitted) when the bucket has no prompt tokens.",
           "type": "integer"
         },
         "cost_nanos": {
@@ -18313,6 +18491,96 @@
         "insightsBucketMonth"
       ]
     },
+    "api.insightsClientItem": {
+      "type": "object",
+      "properties": {
+        "cache_creation_tokens": {
+          "type": "integer"
+        },
+        "cache_read_tokens": {
+          "type": "integer"
+        },
+        "cached_tokens": {
+          "type": "integer"
+        },
+        "category": {
+          "type": "string"
+        },
+        "cost_nanos": {
+          "type": "integer"
+        },
+        "costed_requests": {
+          "type": "integer"
+        },
+        "failures": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "input_tokens": {
+          "type": "integer"
+        },
+        "latency_sum_ms": {
+          "type": "integer"
+        },
+        "net_tokens": {
+          "type": "integer"
+        },
+        "output_tokens": {
+          "type": "integer"
+        },
+        "priced_requests": {
+          "type": "integer"
+        },
+        "raw_prefix": {
+          "type": "string"
+        },
+        "reasoning_tokens": {
+          "type": "integer"
+        },
+        "requests": {
+          "type": "integer"
+        },
+        "total_tokens": {
+          "type": "integer"
+        },
+        "ttft_count": {
+          "type": "integer"
+        },
+        "ttft_sum_ms": {
+          "type": "integer"
+        }
+      }
+    },
+    "api.insightsClientsCoverage": {
+      "type": "object",
+      "properties": {
+        "retained_requests": {
+          "type": "integer"
+        },
+        "total_requests": {
+          "type": "integer"
+        }
+      }
+    },
+    "api.insightsClientsResponse": {
+      "type": "object",
+      "properties": {
+        "clients": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/api.insightsClientItem"
+          }
+        },
+        "coverage": {
+          "$ref": "#/definitions/api.insightsClientsCoverage"
+        },
+        "window": {
+          "$ref": "#/definitions/api.insightsWindow"
+        }
+      }
+    },
     "api.insightsCompareWindow": {
       "type": "object",
       "properties": {
@@ -18463,6 +18731,9 @@
         "hour": {
           "type": "integer"
         },
+        "net_tokens": {
+          "type": "integer"
+        },
         "requests": {
           "type": "integer"
         },
@@ -18495,6 +18766,10 @@
       "properties": {
         "bucket": {
           "$ref": "#/definitions/api.insightsBucket"
+        },
+        "clipped": {
+          "description": "Clipped reports that a client filter started the read at the request-record\nhorizon: client attribution is kept only as long as the records.",
+          "type": "boolean"
         },
         "from": {
           "type": "integer"
@@ -20530,6 +20805,18 @@
         "auth_type": {
           "type": "string"
         },
+        "client_agent": {
+          "type": "string"
+        },
+        "client_agent_category": {
+          "description": "the glyph for a client without brand artwork",
+          "type": "string",
+          "enum": [
+            "agent",
+            "sdk",
+            "unknown"
+          ]
+        },
         "cost_usd": {
           "type": "number"
         },
@@ -22041,6 +22328,18 @@
       "type": "object",
       "properties": {
         "canonical_requests": {
+          "type": "integer"
+        },
+        "completion_tokens": {
+          "type": "integer"
+        },
+        "effective_cache_read_tokens": {
+          "type": "integer"
+        },
+        "effective_total_tokens": {
+          "type": "integer"
+        },
+        "prompt_tokens": {
           "type": "integer"
         },
         "raw_input_tokens": {

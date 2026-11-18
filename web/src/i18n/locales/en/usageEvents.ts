@@ -276,6 +276,7 @@ export default {
   'events.col_tokens': 'Tokens',
   'events.col_cache_rate': 'Cache Rate',
   'events.col_key': 'Key',
+  'events.col_client': 'Client',
   'events.col_ua': 'UA',
   'events.col_resizer': 'Resize column (double-click to reset)',
   'events.reset_columns': 'Reset Columns',
@@ -447,4 +448,5 @@ export default {
   'events.cause_upstream_hint': 'The upstream failed internally. When the configuration is not the cause, it usually recovers by itself.',
   'events.cause_unknown': 'Request did not succeed',
   'events.cause_unknown_hint': 'No clear cause was recorded. Diagnostics shows the upstream response and related errors.',
+  'events.filter_chip_client_agent': 'Client: {val}',
 } satisfies Translation<typeof source>;

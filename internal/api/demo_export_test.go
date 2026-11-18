@@ -240,6 +240,7 @@ func demoExportCases() []demoExportCase {
 			demoExportCase{Name: "dashboard-tail-" + preset, Path: "/api/v1/management/dashboard/tail?" + window},
 			demoExportCase{Name: "dashboard-models-call-" + preset, Path: "/api/v1/management/dashboard/models?" + window + "&group_by=call"},
 			demoExportCase{Name: "dashboard-models-model-" + preset, Path: "/api/v1/management/dashboard/models?" + window + "&group_by=model"},
+			demoExportCase{Name: "dashboard-models-client-" + preset, Path: "/api/v1/management/dashboard/models?" + window + "&group_by=client"},
 			demoExportCase{Name: "dashboard-providers-" + preset, Path: "/api/v1/management/dashboard/providers?" + window},
 			demoExportCase{Name: "client-key-usage-" + preset, Path: "/api/v1/management/client-key-usage?" + window},
 		)
@@ -267,6 +268,7 @@ func demoExportCases() []demoExportCase {
 		demoExportCase{Name: "dashboard-tail-all", Path: "/api/v1/management/dashboard/tail?" + allTime},
 		demoExportCase{Name: "dashboard-models-call-all", Path: "/api/v1/management/dashboard/models?" + allTime + "&group_by=call"},
 		demoExportCase{Name: "dashboard-models-model-all", Path: "/api/v1/management/dashboard/models?" + allTime + "&group_by=model"},
+		demoExportCase{Name: "dashboard-models-client-all", Path: "/api/v1/management/dashboard/models?" + allTime + "&group_by=client"},
 		demoExportCase{Name: "dashboard-providers-all", Path: "/api/v1/management/dashboard/providers?" + allTime},
 	)
 	// The static replay serves relative presets and all-time as closed snapshots.
@@ -275,6 +277,7 @@ func demoExportCases() []demoExportCase {
 		cases = append(cases,
 			demoExportCase{Name: "insights-cube-" + preset, Path: "/api/v1/management/insights/cube?preset=" + preset},
 			demoExportCase{Name: "insights-rhythm-" + preset, Path: "/api/v1/management/insights/rhythm?preset=" + preset},
+			demoExportCase{Name: "insights-clients-" + preset, Path: "/api/v1/management/insights/clients?preset=" + preset},
 		)
 	}
 	// The heatmap is asked for in the viewer's own zone; the export keeps a UTC and a
@@ -444,6 +447,14 @@ func buildDemoExportDataset(t *testing.T) (demoExportResponses, []byte) {
 			}
 			if len(rhythm.Cells) != 7*24 || rhythm.Window.Timezone == "" {
 				t.Fatalf("%s must carry a window and 168 rhythm cells", one.Name)
+			}
+		} else if strings.HasPrefix(one.Name, "insights-clients-") {
+			var clients insightsClientsResponse
+			if err := json.Unmarshal([]byte(responses[one.Name].Body), &clients); err != nil {
+				t.Fatal(err)
+			}
+			if len(clients.Clients) == 0 || clients.Window.Timezone == "" {
+				t.Fatalf("%s must carry a window and client attribution rows", one.Name)
 			}
 		}
 	}

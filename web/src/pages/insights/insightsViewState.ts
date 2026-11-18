@@ -8,13 +8,15 @@
 
 import { INSIGHTS_BUCKETS, type InsightsBucketChoice } from '../../types/insights';
 import {
-  INSIGHTS_DIMENSIONS,
+  INSIGHTS_FILTER_KEYS,
   INSIGHTS_METRICS,
+  TOKEN_SCOPES,
   rowValue,
   type InsightsCube,
-  type InsightsDimension,
+  type InsightsFilterKey,
   type InsightsFilters,
   type InsightsMetric,
+  type TokenScope,
 } from '../../types/insightsCube';
 
 /** What the trend stacks by; `none` draws the whole selection as one series. */
@@ -26,11 +28,13 @@ export interface InsightsViewState {
   grouping: InsightsGrouping;
   bucket: InsightsBucketChoice;
   isComparing: boolean;
+  /** Whether the token metric counts cache traffic. */
+  tokenScope: TokenScope;
   filters: InsightsFilters;
 }
 
 export const DEFAULT_INSIGHTS_VIEW: InsightsViewState = {
-  metric: 'tokens', grouping: 'model', bucket: 'auto', isComparing: true, filters: {},
+  metric: 'tokens', grouping: 'model', bucket: 'auto', isComparing: true, tokenScope: 'all', filters: {},
 };
 
 function oneOf<T extends string>(values: readonly T[], raw: string | null, fallback: T): T {
@@ -39,7 +43,7 @@ function oneOf<T extends string>(values: readonly T[], raw: string | null, fallb
 
 export function readInsightsView(search: URLSearchParams): InsightsViewState {
   const filters: InsightsFilters = {};
-  for (const dimension of INSIGHTS_DIMENSIONS) {
+  for (const dimension of INSIGHTS_FILTER_KEYS) {
     const values = search.getAll(dimension).filter(Boolean);
     if (values.length > 0) filters[dimension] = [...new Set(values)];
   }
@@ -48,6 +52,7 @@ export function readInsightsView(search: URLSearchParams): InsightsViewState {
     grouping: oneOf(INSIGHTS_GROUPINGS, search.get('group'), DEFAULT_INSIGHTS_VIEW.grouping),
     bucket: oneOf(INSIGHTS_BUCKETS, search.get('bucket'), DEFAULT_INSIGHTS_VIEW.bucket),
     isComparing: search.get('compare') !== 'off',
+    tokenScope: oneOf(TOKEN_SCOPES, search.get('scope'), DEFAULT_INSIGHTS_VIEW.tokenScope),
     filters,
   };
 }
@@ -59,14 +64,15 @@ export function writeInsightsView(view: InsightsViewState): URLSearchParams {
   if (view.grouping !== DEFAULT_INSIGHTS_VIEW.grouping) search.set('group', view.grouping);
   if (view.bucket !== DEFAULT_INSIGHTS_VIEW.bucket) search.set('bucket', view.bucket);
   if (!view.isComparing) search.set('compare', 'off');
-  for (const dimension of INSIGHTS_DIMENSIONS) {
+  if (view.tokenScope !== DEFAULT_INSIGHTS_VIEW.tokenScope) search.set('scope', view.tokenScope);
+  for (const dimension of INSIGHTS_FILTER_KEYS) {
     for (const value of view.filters[dimension] ?? []) search.append(dimension, value);
   }
   return search;
 }
 
 /** Adds or removes one value of one dimension's filter. */
-export function toggleFilter(filters: InsightsFilters, dimension: InsightsDimension, value: string): InsightsFilters {
+export function toggleFilter(filters: InsightsFilters, dimension: InsightsFilterKey, value: string): InsightsFilters {
   const current = filters[dimension] ?? [];
   const next = current.includes(value) ? current.filter((item) => item !== value) : [...current, value];
   const result = { ...filters };
@@ -76,7 +82,7 @@ export function toggleFilter(filters: InsightsFilters, dimension: InsightsDimens
 }
 
 export function hasFilters(filters: InsightsFilters): boolean {
-  return INSIGHTS_DIMENSIONS.some((dimension) => (filters[dimension]?.length ?? 0) > 0);
+  return INSIGHTS_FILTER_KEYS.some((dimension) => (filters[dimension]?.length ?? 0) > 0);
 }
 
 /**

@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useEffect, useState } from 'react';
 
 import { Collapse } from '@/components/ui/accordion';
@@ -13,14 +14,18 @@ import {
   type PayloadKVCondition,
   type PayloadModelItem,
   type PayloadValidationIssue,
+  type SavedInactiveReplaceTargetEntry,
+  type UnresolvedReplacePendingEntry,
 } from './payloadRules';
 import {
   renderFilterCategoryContent,
   renderRawCategoryContent,
+  renderReplaceCategoryContent,
   renderTypedCategoryContent,
 } from './payloadRuleSections';
 import { usePayloadRulesDraft } from './usePayloadRulesDraft';
 import { Tag } from '../common/Tag';
+import { Notice } from '../feedback';
 import './config.css';
 import { AppModal } from '../common/AppModal';
 
@@ -29,20 +34,52 @@ export type { PayloadValidationIssue };
 
 export interface PayloadRulesEditorProps {
   doc: Document | null;
+  liveDocRef?: React.MutableRefObject<Document | null>;
   onDocChange: () => void;
   onValidationChange?: (issues: PayloadValidationIssue[]) => void;
+  onPendingChange?: (hasPending: boolean) => void;
+  unresolvedPending?: UnresolvedReplacePendingEntry[];
+  onUnresolvedPendingChange?: React.Dispatch<React.SetStateAction<UnresolvedReplacePendingEntry[]>>;
+  onMountChange?: (mounted: boolean) => void;
+  flushPendingRef?: React.MutableRefObject<(() => boolean) | null>;
+  clearPendingRef?: React.MutableRefObject<(() => void) | null>;
+  savedInactiveTargetsRef?: React.MutableRefObject<SavedInactiveReplaceTargetEntry[]>;
+  resetVersion?: number;
   validateTrigger?: number;
 }
 
 export const PayloadRulesEditor: React.FC<PayloadRulesEditorProps> = ({
   doc,
+  liveDocRef,
   onDocChange,
   onValidationChange,
+  onPendingChange,
+  unresolvedPending,
+  onUnresolvedPendingChange,
+  onMountChange,
+  flushPendingRef,
+  clearPendingRef,
+  savedInactiveTargetsRef,
+  resetVersion,
   validateTrigger,
 }) => {
   // The draft is where every panel's state and every mutation lives; the panels
   // themselves are rendered by `payloadRuleSections`, each given this draft.
-  const draft = usePayloadRulesDraft({ doc, onDocChange, onValidationChange, validateTrigger });
+  const draft = usePayloadRulesDraft({
+    doc,
+    liveDocRef,
+    onDocChange,
+    onValidationChange,
+    onPendingChange,
+    unresolvedPending,
+    onUnresolvedPendingChange,
+    onMountChange,
+    flushPendingRef,
+    clearPendingRef,
+    savedInactiveTargetsRef,
+    resetVersion,
+    validateTrigger,
+  });
   const {
     activePanels,
     setActivePanels,
@@ -50,10 +87,11 @@ export const PayloadRulesEditor: React.FC<PayloadRulesEditorProps> = ({
     defaultRawRules,
     overrideRules,
     overrideRawRules,
+    replaceRules,
     filterRules,
     advModalState,
     setAdvModalState,
-    updateModelInRule,
+    updateModelById,
     t,
   } = draft;
 
@@ -119,6 +157,21 @@ export const PayloadRulesEditor: React.FC<PayloadRulesEditorProps> = ({
       children: renderRawCategoryContent(draft, 'override-raw'),
     },
     {
+      key: 'replace',
+      label: (
+        <div className="payload-panel-header">
+          <div className="payload-panel-title-wrap">
+            <span className="payload-panel-title">{t('cfg.payload_cat_replace')}</span>
+            <span className="payload-panel-desc">{t('cfg.payload_cat_replace_desc')}</span>
+          </div>
+          {replaceRules.length > 0 && (
+            <Tag>{replaceRules.length}</Tag>
+          )}
+        </div>
+      ),
+      children: renderReplaceCategoryContent(draft),
+    },
+    {
       key: 'filter',
       label: (
         <div className="payload-panel-header">
@@ -144,14 +197,20 @@ export const PayloadRulesEditor: React.FC<PayloadRulesEditorProps> = ({
     } else {
       setAdvDraft(null);
     }
-  }, [advModalState]);
+  }, [
+    advModalState?.open,
+    advModalState?.category,
+    advModalState?.ruleId,
+    advModalState?.modelId,
+    advModalState?.model,
+  ]);
 
   const handleSaveAdvanced = () => {
-    if (!advModalState || !advDraft) return;
-    updateModelInRule(
+    if (!advModalState || !advDraft || advModalState.isTargetStale) return;
+    updateModelById(
       advModalState.category,
-      advModalState.ruleIndex,
-      advModalState.modelIndex,
+      advModalState.ruleId,
+      advModalState.modelId,
       advDraft
     );
     setAdvModalState(null);
@@ -233,12 +292,21 @@ export const PayloadRulesEditor: React.FC<PayloadRulesEditorProps> = ({
         open={Boolean(advModalState?.open)}
         onOk={handleSaveAdvanced}
         onCancel={() => setAdvModalState(null)}
+        okButtonProps={advModalState?.isTargetStale ? { disabled: true } : undefined}
+        mask={advModalState?.isTargetStale ? { closable: false } : true}
         okText={t('common.confirm')}
-        cancelText={t('common.cancel')}
+        cancelText={advModalState?.isTargetStale ? t('cfg.payload_replace_pending_discard') : t('common.cancel')}
         destroyOnHidden
       >
         {advDraft && (
           <div className="payload-adv-modal-body">
+            {advModalState?.isTargetStale && (
+              <Notice
+                tone="warning"
+                title={t('cfg.payload_adv_target_stale')}
+                data-testid="payload-adv-stale-notice"
+              />
+            )}
             {/* from-protocol */}
             <div className="payload-adv-field">
               <label className="payload-adv-label">{t('cfg.payload_adv_from_proto')}</label>
